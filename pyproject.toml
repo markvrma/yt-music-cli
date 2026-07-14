@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msm-player"
+version = "0.1.0"
+description = "Terminal player for YouTube Music + local library, with cmusfm scrobbling and pixelated album art"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Mark Verma" }]
+keywords = ["youtube-music", "tui", "curses", "cmus", "scrobble", "mpv"]
+dependencies = [
+    "ytmusicapi>=1.10",
+    "Pillow>=10",
+    "requests>=2",
+]
+
+[project.scripts]
+msm = "msm.tui:main"
+
+[project.urls]
+Homepage = "https://github.com/markverma/msm-player"
+
+[tool.setuptools]
+packages = ["msm"]
+
+# External tools are NOT pip-installable — install separately:
+#   mpv, yt-dlp, ffmpeg (ffprobe), cmusfm

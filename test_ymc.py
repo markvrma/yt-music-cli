@@ -167,6 +167,40 @@ def test_enqueue_appends_and_merges_by_url():
     assert p.by_url == {"u1": t1, "u2": t2}   # queued tracks resolvable for scrobble
 
 
+def test_play_next_inserts_after_current_in_order():
+    class StubIPC:
+        def __init__(self, pos):
+            self.pos, self.cmds = pos, []
+
+        def cmd(self, c):
+            self.cmds.append(c)
+            return self.pos if c == ["get_property", "playlist-pos"] else None
+
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC(2)          # current track at playlist index 2
+    p.by_url = {}
+    t1 = {"url": "u1", "title": "A"}
+    t2 = {"url": "u2", "title": "B"}
+    idx = p.play_next([t1, t2])
+    assert idx == 3             # first inserted right after current (2 -> 3)
+    assert [c for c in p.ipc.cmds if c[0] == "loadfile"] == [
+        ["loadfile", "u1", "insert-at", 3],
+        ["loadfile", "u2", "insert-at", 4],   # order preserved, not reversed
+    ]
+    assert p.by_url == {"u1": t1, "u2": t2}
+
+
+def test_play_next_returns_none_when_idle():
+    class StubIPC:
+        def cmd(self, c):
+            return -1           # mpv reports no current entry
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC()
+    p.by_url = {}
+    assert p.play_next([{"url": "u1", "title": "A"}]) is None
+    assert p.by_url == {}       # nothing queued when idle
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

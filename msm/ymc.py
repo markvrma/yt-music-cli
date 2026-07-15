@@ -487,6 +487,18 @@ class Player:
         for t in tracks:
             self.ipc.cmd(["loadfile", t["url"], "append"])
 
+    def play_next(self, tracks):
+        """Insert tracks right after the current one (the rest of the queue is
+        left untouched). Returns the playlist index of the first inserted track,
+        or None if nothing is playing (caller should start playback instead)."""
+        pos = self.ipc.cmd(["get_property", "playlist-pos"])
+        if pos is None or pos < 0:
+            return None
+        self.by_url.update({t["url"]: t for t in tracks})
+        for i, t in enumerate(tracks):
+            self.ipc.cmd(["loadfile", t["url"], "insert-at", pos + 1 + i])
+        return pos + 1
+
     def toggle_pause(self):
         self.ipc.cmd(["cycle", "pause"])
 

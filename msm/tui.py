@@ -7,12 +7,11 @@ Screens:
           album art (square, capped); bottom = progress bar.
   search  '/' opens it: type query, enter runs it, jk pick a result,
           enter = load into browse (no play), f = load + play, Esc = back.
-Keys: h/l switch pane, j/k move, space pause, n/p next/prev, q quit.
+Keys: h/l switch pane, j/k move, space pause, n/p next/prev, L like, q quit.
 """
 import curses
 import os
-
-from ytmusicapi import YTMusic
+import threading
 
 from . import ymc
 
@@ -145,10 +144,11 @@ def draw_art(win, path):
             _put(win, 1 + cy, 1 + cx, "▀", 1, curses.color_pair(p) if p else 0)
 
 
-def draw_progress(stdscr, y, w, player):
+def draw_progress(stdscr, y, w, player, note=""):
     pos, dur, paused, title = player.progress()
     state = "‖" if paused else "▶"
-    win = box(stdscr, y, 0, 3, w, "%s %s" % (state, title), False)
+    label = note if note else "%s %s" % (state, title)
+    win = box(stdscr, y, 0, 3, w, label, False)
     if not win:
         return
     bw = w - 2
@@ -186,28 +186,55 @@ def run(stdscr, yt, player):
 
     hist = ymc.load_history()
     local = ymc.scan_local()
+    recs = []            # authed: YT Music recs, filled off-thread after first paint
     screen = "browse"
-    focus = 0            # 0=NowPlaying 1=Local 2=Last5  (search: 0=bar 1=results)
+    focus = 0            # 0=NowPlaying 1=Local 2=pane2  (search: 0=bar 1=results)
     sel = [0, 0, 0]      # per-pane selection
     sel_s = 0
     query = ""
     results = []
     now = {"album": None, "art": None}
 
+    if ymc.AUTHED:  # network call -> off-thread so it can't delay first paint
+        threading.Thread(target=lambda: recs.extend(ymc.get_recs(yt)),
+                          daemon=True).start()
+
+    def pane2():
+        """Active pane-2 list: YT recs when authed, else local last-5."""
+        return recs if ymc.AUTHED else hist
+
     def set_now(album):
         now["album"] = album
         now["art"] = art_for(album)
 
+    def ensure_tracks(album):
+        """Fill an album's tracks lazily (local scan or YT rec resolve). -> bool playable."""
+        if album.get("tracks") is None:
+            if album.get("local"):
+                ymc.load_local_album(album)
+            elif album.get("rec"):
+                try:
+                    _, tracks, thumb = ymc.resolve_result(yt, album["rec"])
+                except Exception:
+                    tracks = []
+                album["tracks"] = tracks
+                if tracks:
+                    album["thumb"] = thumb
+        return bool(album.get("tracks"))
+
     def do_play(album, start_idx=0):
         nonlocal hist
-        if album.get("local") and album.get("tracks") is None:
-            ymc.load_local_album(album)
+        if not ensure_tracks(album):
+            return
         set_now(album)
         hist = ymc.record(album["title"], album["tracks"], album.get("thumb") or "")
         player.play(album["tracks"], start_idx)
 
     if hist:
         set_now(hist[0])
+
+    flash = ""       # transient status shown in the progress bar (e.g. "♥ liked")
+    flash_ttl = 0    # refresh cycles the flash stays visible
 
     while True:
         stdscr.erase()
@@ -242,9 +269,12 @@ def run(stdscr, yt, player):
                 draw_rows(wm, [a["title"] for a in local], sel[1], focus == 1)
 
             if rcw:
-                w5 = box(stdscr, 0, left_w, last5_h, rcw, "LAST 5  (enter=open f=play)", focus == 2)
+                p2 = pane2()
+                title2 = "FOR YOU  (enter=open f=play)" if ymc.AUTHED else "LAST 5  (enter=open f=play)"
+                w5 = box(stdscr, 0, left_w, last5_h, rcw, title2, focus == 2)
                 if w5:
-                    draw_rows(w5, [a["title"] for a in hist], sel[2], focus == 2)
+                    rows2 = [a["title"] for a in p2] or (["loading…"] if ymc.AUTHED else [])
+                    draw_rows(w5, rows2, sel[2], focus == 2)
                 wa = box(stdscr, main_h - art_bh, left_w, art_bh, art_bw, "cover", False)
                 if wa:
                     draw_art(wa, now["art"])
@@ -258,7 +288,9 @@ def run(stdscr, yt, player):
                 draw_rows(wr, ["[%s] %s — %s" % (r.get("resultType", "?"), r.get("title", "?"),
                                ymc.artists_str(r)) for r in results], sel_s, focus == 1)
 
-        draw_progress(stdscr, main_h, W, player)
+        draw_progress(stdscr, main_h, W, player, flash if flash_ttl > 0 else "")
+        if flash_ttl > 0:
+            flash_ttl -= 1
         stdscr.refresh()
 
         c = stdscr.getch()
@@ -316,10 +348,10 @@ def run(stdscr, yt, player):
         elif c == ord("l"):
             focus = min(2, focus + 1)
         elif c in (ord("j"), curses.KEY_DOWN):
-            n = _pane_len(focus, now, local, hist)
+            n = _pane_len(focus, now, local, pane2())
             sel[focus] = clamp(sel[focus] + 1, 0, n - 1)
         elif c in (ord("k"), curses.KEY_UP):
-            n = _pane_len(focus, now, local, hist)
+            n = _pane_len(focus, now, local, pane2())
             sel[focus] = clamp(sel[focus] - 1, 0, n - 1)
         elif c in (curses.KEY_ENTER, 10, 13):
             if focus == 0 and now["album"] and now["album"].get("tracks"):
@@ -330,28 +362,41 @@ def run(stdscr, yt, player):
                     ymc.load_local_album(a)
                 set_now(a)
                 focus, sel[0] = 0, 0
-            elif focus == 2 and hist:
-                set_now(hist[sel[2]])
-                focus, sel[0] = 0, 0
+            elif focus == 2 and pane2():
+                a = pane2()[sel[2]]
+                if ensure_tracks(a):  # rec items resolve here; hist items no-op
+                    set_now(a)
+                    focus, sel[0] = 0, 0
         elif c == ord("f"):
             if focus == 0 and now["album"] and now["album"].get("tracks"):
                 do_play(now["album"], 0)
             elif focus == 1 and local:
                 do_play(local[sel[1]], 0)
                 focus, sel[0] = 0, 0
-            elif focus == 2 and hist:
-                do_play(hist[sel[2]], 0)
+            elif focus == 2 and pane2():
+                do_play(pane2()[sel[2]], 0)
                 focus, sel[0] = 0, 0
+        elif c == ord("L"):  # shift+l: thumbs-up the highlighted (or playing) track
+            al = now["album"]
+            track = (al["tracks"][sel[0]] if focus == 0 and al and al.get("tracks")
+                     else player.current)
+            if track and ymc.like_track(yt, track):
+                flash, flash_ttl = "♥ liked: " + track["title"], 6
+            else:
+                flash, flash_ttl = "♥ like failed (needs YT sign-in + a YT track)", 6
 
 
 def main():
     import shutil
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "auth":
+        ymc.setup_auth(sys.argv[2] if len(sys.argv) > 2 else None)
+        return
     for tool in ("mpv", "cmusfm"):
         if not shutil.which(tool):
             sys.exit("missing required tool: " + tool)
-    yt = YTMusic()
-    player = ymc.Player()
+    yt = ymc.get_yt()
+    player = ymc.Player(yt)
     try:
         curses.wrapper(run, yt, player)
     finally:

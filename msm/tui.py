@@ -7,7 +7,9 @@ Screens:
           album art (square, capped); bottom = progress bar.
   search  '/' opens it: type query, enter runs it, jk pick a result,
           enter = load into browse (no play), f = load + play, Esc = back.
-Keys: h/l switch pane, j/k move, space pause, n/p next/prev, L like, q quit.
+Keys: h/l switch pane, j/k move, space pause, n/p next/prev, a queue,
+      L like, q quit. Queue (a) = play the selected song/album after the
+      current now-playing has finished.
 """
 import curses
 import os
@@ -204,6 +206,11 @@ def run(stdscr, yt, player):
         return recs if ymc.AUTHED else hist
 
     def set_now(album):
+        # own copy of the track list: queued items append to the NOW pane
+        # (see the 'a' handler) without mutating the source album object
+        # shared by the LOCAL / FOR YOU / history lists.
+        if album and album.get("tracks") is not None:
+            album = {**album, "tracks": list(album["tracks"])}
         now["album"] = album
         now["art"] = art_for(album)
 
@@ -222,19 +229,64 @@ def run(stdscr, yt, player):
                     album["thumb"] = thumb
         return bool(album.get("tracks"))
 
+    def stamp_art(tracks, thumb):
+        """Tag each track with its album art so the cover can follow the
+        currently-playing track across queued albums (tracks carry no art
+        of their own)."""
+        for t in tracks:
+            t.setdefault("thumb", thumb or "")
+
     def do_play(album, start_idx=0):
         nonlocal hist
         if not ensure_tracks(album):
             return
+        stamp_art(album["tracks"], album.get("thumb"))
         set_now(album)
         hist = ymc.record(album["title"], album["tracks"], album.get("thumb") or "")
         player.play(album["tracks"], start_idx)
+
+    def queue_tracks(tracks, label, thumb=""):
+        """Queue tracks: append to the mpv playlist tail AND the visible NOW
+        list. If nothing is playing yet, start playback instead. Reused by the
+        browse and search 'a' keybinds."""
+        nonlocal flash, flash_ttl
+        stamp_art(tracks, thumb)
+        al = now["album"]
+        if al and al.get("tracks") is not None:
+            player.enqueue(tracks)
+            al["tracks"].extend(tracks)
+            flash, flash_ttl = "⏭ queued: " + label, 6
+        else:
+            do_play({"title": label, "tracks": tracks, "thumb": thumb}, 0)
+
+    def cur_album():
+        """Album selected in the focused list pane (1=LOCAL, 2=FOR YOU/hist),
+        or None. Pane 0 (NOW) has no separate album to open."""
+        if focus == 1:
+            return local[sel[1]] if local else None
+        if focus == 2:
+            p2 = pane2()
+            return p2[sel[2]] if p2 else None
+        return None
 
     if hist:
         set_now(hist[0])
 
     flash = ""       # transient status shown in the progress bar (e.g. "♥ liked")
     flash_ttl = 0    # refresh cycles the flash stays visible
+    art_memo = {"url": None, "path": None}  # cover art of the playing track
+
+    def cur_art():
+        """Cover for the currently-playing track (follows it across queued
+        albums); falls back to the opened album's art when nothing plays."""
+        ct = player.current
+        if ct and ct.get("thumb"):
+            if ct["url"] != art_memo["url"]:
+                art_memo["url"] = ct["url"]
+                art_memo["path"] = art_for({"title": ct.get("album") or ct.get("title") or "art",
+                                            "thumb": ct["thumb"]})
+            return art_memo["path"]
+        return now["art"]
 
     while True:
         stdscr.erase()
@@ -277,13 +329,13 @@ def run(stdscr, yt, player):
                     draw_rows(w5, rows2, sel[2], focus == 2)
                 wa = box(stdscr, main_h - art_bh, left_w, art_bh, art_bw, "cover", False)
                 if wa:
-                    draw_art(wa, now["art"])
+                    draw_art(wa, cur_art())
         else:  # search
             wb = box(stdscr, 0, 0, 3, W, "search", focus == 0)
             if wb:
                 _put(wb, 1, 1, " " + query + ("█" if focus == 0 else ""), W - 2,
                      curses.color_pair(ACCENT))
-            wr = box(stdscr, 3, 0, main_h - 3, W, "RESULTS  (enter=load f=play Esc=back)", focus == 1)
+            wr = box(stdscr, 3, 0, main_h - 3, W, "RESULTS  (enter=load f=play a=queue Esc=back)", focus == 1)
             if wr:
                 draw_rows(wr, ["[%s] %s — %s" % (r.get("resultType", "?"), r.get("title", "?"),
                                ymc.artists_str(r)) for r in results], sel_s, focus == 1)
@@ -317,19 +369,22 @@ def run(stdscr, yt, player):
                     sel_s = clamp(sel_s + 1, 0, len(results) - 1)
                 elif c == ord("h"):
                     focus = 0
-                elif c in (curses.KEY_ENTER, 10, 13, ord("f")) and results:
+                elif c in (curses.KEY_ENTER, 10, 13, ord("f"), ord("a")) and results:
                     try:
                         title, tracks, thumb = ymc.resolve_result(yt, results[sel_s])
                     except Exception:
                         tracks = []
                     if tracks:
                         album = {"title": title, "tracks": tracks, "thumb": thumb}
-                        if c == ord("f"):
+                        if c == ord("a"):
+                            queue_tracks(tracks, title, thumb)  # stays in search
+                        elif c == ord("f"):
                             do_play(album, 0)
+                            screen, focus, sel[0] = "browse", 0, 0
                         else:
                             hist = ymc.record(title, tracks, thumb)
                             set_now(album)
-                        screen, focus, sel[0] = "browse", 0, 0
+                            screen, focus, sel[0] = "browse", 0, 0
             continue
 
         # ----- browse screen -----
@@ -356,34 +411,40 @@ def run(stdscr, yt, player):
         elif c in (curses.KEY_ENTER, 10, 13):
             if focus == 0 and now["album"] and now["album"].get("tracks"):
                 do_play(now["album"], sel[0])
-            elif focus == 1 and local:
-                a = local[sel[1]]
-                if a.get("tracks") is None:
-                    ymc.load_local_album(a)
-                set_now(a)
-                focus, sel[0] = 0, 0
-            elif focus == 2 and pane2():
-                a = pane2()[sel[2]]
-                if ensure_tracks(a):  # rec items resolve here; hist items no-op
+            else:
+                a = cur_album()  # rec items resolve here; hist items no-op
+                if a and ensure_tracks(a):
                     set_now(a)
                     focus, sel[0] = 0, 0
         elif c == ord("f"):
             if focus == 0 and now["album"] and now["album"].get("tracks"):
                 do_play(now["album"], 0)
-            elif focus == 1 and local:
-                do_play(local[sel[1]], 0)
-                focus, sel[0] = 0, 0
-            elif focus == 2 and pane2():
-                do_play(pane2()[sel[2]], 0)
-                focus, sel[0] = 0, 0
+            else:
+                a = cur_album()
+                if a:
+                    do_play(a, 0)
+                    focus, sel[0] = 0, 0
+        elif c == ord("a"):  # queue: append to the NOW list, plays after current
+            al = now["album"]
+            if focus == 0 and al and al.get("tracks"):
+                t = al["tracks"][sel[0]]
+                queue_tracks([t], t["title"], t.get("thumb") or (al.get("thumb") or ""))
+            else:
+                a = cur_album()
+                if a and ensure_tracks(a):
+                    queue_tracks(list(a["tracks"]), a["title"], a.get("thumb") or "")
+                elif a:
+                    flash, flash_ttl = "queue failed — run `msm auth`?", 8
         elif c == ord("L"):  # shift+l: thumbs-up the highlighted (or playing) track
             al = now["album"]
             track = (al["tracks"][sel[0]] if focus == 0 and al and al.get("tracks")
                      else player.current)
-            if track and ymc.like_track(yt, track):
+            if not track:
+                flash, flash_ttl = "nothing to like", 6
+            elif ymc.like_track(yt, track):
                 flash, flash_ttl = "♥ liked: " + track["title"], 6
             else:
-                flash, flash_ttl = "♥ like failed (needs YT sign-in + a YT track)", 6
+                flash, flash_ttl = "♥ like failed — run `msm auth` (session expired?)", 8
 
 
 def main():

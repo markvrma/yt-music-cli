@@ -472,13 +472,20 @@ class Player:
         threading.Thread(target=self._watch, daemon=True).start()
 
     def play(self, tracks, start=0):
-        self.by_url = {t["url"]: t for t in tracks}
+        self.by_url = {tracks[0]["url"]: tracks[0]}
         self.ipc.cmd(["loadfile", tracks[0]["url"], "replace"])
-        for t in tracks[1:]:
-            self.ipc.cmd(["loadfile", t["url"], "append"])
+        self.enqueue(tracks[1:])
         if start:
             self.ipc.cmd(["set_property", "playlist-pos", start])
         self.ipc.cmd(["set_property", "pause", False])
+
+    def enqueue(self, tracks):
+        """Append tracks to the tail of the mpv playlist — they play after
+        whatever is already queued. Merges into by_url so the watch loop can
+        resolve queued tracks for scrobble/display."""
+        self.by_url.update({t["url"]: t for t in tracks})
+        for t in tracks:
+            self.ipc.cmd(["loadfile", t["url"], "append"])
 
     def toggle_pause(self):
         self.ipc.cmd(["cycle", "pause"])

@@ -149,6 +149,24 @@ def test_history_prepend_dedupe_cap():
     assert [a["title"] for a in h].count("Album 3") == 1  # no dup
 
 
+def test_enqueue_appends_and_merges_by_url():
+    class StubIPC:
+        def __init__(self):
+            self.cmds = []
+
+        def cmd(self, c):
+            self.cmds.append(c)
+
+    p = object.__new__(ymc.Player)  # bypass __init__ (spawns real mpv)
+    p.ipc = StubIPC()
+    p.by_url = {}
+    t1 = {"url": "u1", "title": "A"}
+    t2 = {"url": "u2", "title": "B"}
+    p.enqueue([t1, t2])
+    assert p.ipc.cmds == [["loadfile", "u1", "append"], ["loadfile", "u2", "append"]]
+    assert p.by_url == {"u1": t1, "u2": t2}   # queued tracks resolvable for scrobble
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -14,6 +14,7 @@ import time
 from ytmusicapi import YTMusic
 
 MPV_SOCK = "/tmp/ymc-mpv.sock"
+MPV_LOG = "/tmp/ymc-mpv.log"        # mpv verbose log — inspect on playback failures
 CONFIG = os.path.expanduser("~/.config/ymc")
 HIST = os.path.join(CONFIG, "history.json")
 AUTH = os.path.join(CONFIG, "browser.json")         # ytmusicapi browser-auth headers
@@ -398,6 +399,18 @@ def record(title, tracks, thumb=""):
 
 # ---- cmusfm scrobble bridge ------------------------------------------------
 
+def cmusfm_reset():
+    """Kill any stale cmusfm server; the next cmusfm call forks a fresh one.
+
+    cmusfm's daemon caches a Last.fm failure for 30 min (SERVICE_RETRY_DELAY) and
+    silently drops now-playing + scrobbles while in that state — after a
+    sleep/wake it can sit there for the rest of the session with no error
+    anywhere. Cheaper to start each msm session with a new daemon."""
+    # ponytail: blunt pkill. If you ever run cmus alongside msm, its in-flight
+    # track loses its scrobble — narrow to a socket health-check if that bites.
+    subprocess.run(["pkill", "-x", "cmusfm"], check=False)
+
+
 def cmusfm(status, track=None):
     """Fire cmusfm the way cmus does as status_display_program."""
     args = ["cmusfm", "status", status]
@@ -462,10 +475,12 @@ class Player:
         self.yt = yt          # authed YTMusic -> record plays to YT history
         self.by_url = {}
         self.current = None
+        cmusfm_reset()
         if os.path.exists(MPV_SOCK):
             os.remove(MPV_SOCK)
         self.proc = subprocess.Popen(
             ["mpv", "--idle=yes", "--no-video", "--no-terminal",
+             "--log-file=" + MPV_LOG, "--msg-level=all=v",
              "--input-ipc-server=" + MPV_SOCK],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.ipc = IPC(self.proc)

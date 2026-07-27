@@ -86,19 +86,48 @@ def draw_rows(win, rows, sel, focused):
 
 # ---- album art (256-color half-block) --------------------------------------
 
+ART_PAIR0 = 10     # art color-pairs live at ART_PAIR0..COLOR_PAIRS-1
+ART_COLORS = 32    # adaptive palette size, stepped down if the cover needs more
+                   # (fg,bg) pairs than the terminal has
+GREY_GATE = 30     # max channel spread that may still snap to the grey ramp
+
 _art_pairs = {}
-_art_next = [10]
+_art_next = [ART_PAIR0]
+_art_owner = [None]   # path whose pairs are currently loaded
 _grid_cache = {}
+
+# xterm-256: the 6x6x6 cube levels are NOT evenly spaced, plus a 24-step grey ramp
+_CUBE = (0, 95, 135, 175, 215, 255)
+_CUBE_RGB = [(_CUBE[j // 36], _CUBE[j // 6 % 6], _CUBE[j % 6]) for j in range(216)]
+_GREY_RGB = [(8 + 10 * i,) * 3 for i in range(24)]
 
 
 def _xterm256(r, g, b):
-    return 16 + 36 * (r // 51) + 6 * (g // 51) + (b // 51)
+    """Nearest xterm-256 index. The old `//51` assumed evenly spaced cube levels
+    and never reached the grey ramp, so blacks came out as colored confetti.
+
+    Only near-neutral pixels may take the ramp, or it desaturates saturated
+    covers to mush. The gate is an absolute spread, not a saturation ratio: a
+    ratio sends dark hues to the cube, whose bottom step is a 0->95 cliff, and
+    shadowed foliage snaps to vivid (0,95,0).
+    """
+    pool = _CUBE_RGB if max(r, g, b) - min(r, g, b) > GREY_GATE else _CUBE_RGB + _GREY_RGB
+    i = min(range(len(pool)), key=lambda k: (pool[k][0] - r) ** 2 +
+            (pool[k][1] - g) ** 2 + (pool[k][2] - b) ** 2)
+    return 16 + i   # cube 0..215 -> 16..231, grey ramp 216..239 -> 232..255
+
+
+def _pair_budget():
+    """How many pairs the art may use. COLOR_PAIRS only exists after
+    start_color(); 256 is the floor (Apple's ncurses 5.7 reports exactly that,
+    which is why art ever ran out of pairs in the first place)."""
+    return min(getattr(curses, "COLOR_PAIRS", 256), 32000) - ART_PAIR0
 
 
 def _pair(fg, bg):
     key = (fg, bg)
     if key not in _art_pairs:
-        if _art_next[0] >= min(curses.COLOR_PAIRS, 32000):
+        if _art_next[0] - ART_PAIR0 >= _pair_budget():
             return 0  # out of pairs -> uncolored
         try:
             curses.init_pair(_art_next[0], fg, bg)
@@ -109,18 +138,42 @@ def _pair(fg, bg):
     return _art_pairs[key]
 
 
+def _quant_grid(img, cols, rows, colors):
+    """(fg,bg) per cell for an n-color adaptive palette of `img`.
+
+    FASTOCTREE, not MEDIANCUT: median cut weights the palette by pixel count, so
+    on a mostly-black cover a small vivid region (Daft Punk's gold helmet) gets
+    merged into the greys. Octree keeps distinct colors distinct.
+    """
+    from PIL import Image
+    q = img.quantize(colors=colors, method=Image.FASTOCTREE, dither=Image.NONE)
+    pal = q.getpalette()[:colors * 3]
+    xt = [_xterm256(*pal[i * 3:i * 3 + 3]) for i in range(len(pal) // 3)]
+    px = q.load()
+    return [[(xt[px[cx, cy * 2]], xt[px[cx, cy * 2 + 1]])
+             for cx in range(cols)] for cy in range(rows)]
+
+
 def _art_grid(path, cols, rows):
-    """Resize art to cols x 2*rows px (NEAREST = pixelated); (fg,bg) per cell.
-    Each cell is a half-block: 1px wide, 2px tall -> square when cols == 2*rows.
+    """Resize art to cols x 2*rows px, reduce to an adaptive palette, map to
+    xterm-256; (fg,bg) per cell. Each cell is a half-block: 1px wide, 2px tall ->
+    square when cols == 2*rows.
+
+    BOX (area average), not NEAREST: at this size NEAREST samples one source pixel
+    per cell, so detailed covers come out as noise. The palette steps down until
+    the cover's (fg,bg) combos fit the pair table; overrunning it renders as
+    uncolored half-blocks, i.e. black and white bars.
     """
     key = (path, cols, rows)
     if key in _grid_cache:
         return _grid_cache[key]
     from PIL import Image
-    img = Image.open(path).convert("RGB").resize((cols, rows * 2), Image.NEAREST)
-    px = img.load()
-    grid = [[(_xterm256(*px[cx, cy * 2]), _xterm256(*px[cx, cy * 2 + 1]))
-             for cx in range(cols)] for cy in range(rows)]
+    img = Image.open(path).convert("RGB").resize((cols, rows * 2), Image.BOX)
+    budget = _pair_budget()
+    for colors in (ART_COLORS, ART_COLORS // 2, 8):
+        grid = _quant_grid(img, cols, rows, colors)
+        if len({p for row in grid for p in row}) <= budget:
+            break
     _grid_cache[key] = grid
     return grid
 
@@ -139,6 +192,13 @@ def draw_art(win, path):
     except Exception:
         _put(win, h // 2, (w - 6) // 2, "no art", 6, curses.color_pair(DIM))
         return
+    if _art_owner[0] != (path, cols, rows):
+        # Only one cover is on screen at a time, so recycle the pair slots.
+        # Without this they leaked per album and a few covers in, every cell
+        # fell back to pair 0 -> uncolored half-blocks (black and white bars).
+        _art_pairs.clear()
+        _art_next[0] = ART_PAIR0
+        _art_owner[0] = (path, cols, rows)
     for cy in range(rows):
         for cx in range(cols):
             fg, bg = grid[cy][cx]

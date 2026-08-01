@@ -14,22 +14,144 @@ import time
 from ytmusicapi import YTMusic
 
 MPV_SOCK = "/tmp/ymc-mpv.sock"
-HIST = os.path.expanduser("~/.config/ymc/history.json")
+MPV_LOG = "/tmp/ymc-mpv.log"        # mpv verbose log — inspect on playback failures
+CONFIG = os.path.expanduser("~/.config/ymc")
+HIST = os.path.join(CONFIG, "history.json")
+AUTH = os.path.join(CONFIG, "browser.json")         # ytmusicapi browser-auth headers
 LOCAL_MUSIC = os.path.expanduser("~/Music")
-ART_CACHE = os.path.expanduser("~/.config/ymc/art")
+ART_CACHE = os.path.join(CONFIG, "art")
 AUDIO_EXT = (".mp3", ".flac", ".m4a", ".opus", ".ogg", ".wav", ".aac", ".wma")
+
+AUTHED = False  # set by get_yt(); read by the TUI to pick pane behavior
+
+
+# ---- auth ------------------------------------------------------------------
+
+def get_yt():
+    """Authed YTMusic if browser.json exists, else unauthenticated. Sets
+    module-level AUTHED. Any load failure falls back to unauth (never raises).
+
+    Browser auth (not OAuth): YouTube's youtubei API rejects generic Google
+    Cloud OAuth tokens with HTTP 400, so history/recs need real website
+    session headers, which is what ytmusicapi's browser auth provides."""
+    global AUTHED
+    AUTHED = False
+    if os.path.exists(AUTH):
+        try:
+            yt = YTMusic(AUTH)
+            AUTHED = True
+            return yt
+        except Exception:
+            pass  # corrupt/expired headers -> unauth, app still browses+plays
+    return YTMusic()
+
+
+def _headers_from_input(raw):
+    """Normalize pasted request info into ytmusicapi's 'key: value\\n' format.
+    Accepts three shapes DevTools produces: a curl command ('Copy as cURL'),
+    clean 'key: value' lines, or Chrome's alternating name/value lines."""
+    if "curl " in raw and " -H " in raw:
+        # Copy as cURL: pull every -H 'k: v' / -H "k: v", plus -b/--cookie.
+        pairs = _re.findall(r"-H\s+'([^']+)'", raw) + _re.findall(r'-H\s+"([^"]+)"', raw)
+        cookie = _re.findall(r"(?:-b|--cookie)\s+'([^']+)'", raw) + \
+                 _re.findall(r'(?:-b|--cookie)\s+"([^"]+)"', raw)
+        if cookie and not any(p.lower().startswith("cookie:") for p in pairs):
+            pairs.append("cookie: " + cookie[0])
+        return "\n".join(pairs)
+    lines = [l for l in raw.split("\n") if l.strip()]
+    if lines and not any(": " in l for l in lines[:4]):
+        # alternating name / value lines -> pair them up
+        lines = ["%s: %s" % (k, v) for k, v in zip(lines[0::2], lines[1::2])]
+    return "\n".join(lines)
+
+
+def setup_auth(source=None):
+    """Save YouTube Music browser-auth headers so plays record to history and
+    recommendations load (chmod 600 — they contain your cookies).
+
+    Reads the request from (in order): a file path arg, else the macOS
+    clipboard (pbpaste), else stdin. Clipboard avoids the fragile terminal
+    paste of a huge multi-line cURL."""
+    import subprocess
+    import sys
+    from ytmusicapi import setup
+    os.makedirs(CONFIG, exist_ok=True)
+
+    if source:
+        with open(os.path.expanduser(source)) as f:
+            raw = f.read()
+    else:
+        raw = ""
+        try:  # macOS: read the copied cURL straight from the clipboard
+            raw = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            raw = ""
+        if not raw.strip():
+            print("Paste request headers / cURL, then press Ctrl-D:")
+            raw = sys.stdin.read()
+
+    headers_raw = _headers_from_input(raw)
+    if "cookie:" not in headers_raw.lower():
+        raise SystemExit(
+            "No 'cookie' header found in the input.\n"
+            "In DevTools -> Network, right-click a /browse POST -> Copy -> "
+            "Copy as cURL, then run `msm auth` again (it reads your clipboard).")
+    setup(filepath=AUTH, headers_raw=headers_raw)
+    os.chmod(AUTH, 0o600)
+    if is_logged_in():
+        print("auth saved to %s and VERIFIED logged in. run `msm` to play." % AUTH)
+    else:
+        print("\nWARNING: headers saved but YouTube treats them as LOGGED OUT.\n"
+              "Recopy the request headers from a fresh, logged-in (non-incognito)\n"
+              "music.youtube.com tab and run `msm auth` again promptly (session\n"
+              "tokens rotate). History recording won't work until this verifies.")
+
+
+def is_logged_in():
+    """True if the saved browser.json is an authenticated YouTube session.
+    Checks the LOGGED_IN flag on the music.youtube.com home page (the youtubei
+    API silently downgrades unauthenticated requests, so this is the reliable
+    signal)."""
+    try:
+        import requests
+        ck = json.load(open(AUTH))
+        r = requests.get("https://music.youtube.com/",
+                         headers={"cookie": ck["cookie"], "user-agent": ck.get("user-agent", "")},
+                         timeout=10)
+        return '"LOGGED_IN":true' in r.text
+    except Exception:
+        return False
 
 
 # ---- YouTube Music ---------------------------------------------------------
 
+import re as _re
+_PLAYCOUNT = _re.compile(r"^[\d.,]+\s*[KMB]?\s*(plays|views)$", _re.I)
+# content-type words get_home() prepends into the artists list as a stray token
+_TYPEWORD = {"song", "video", "album", "single", "ep", "playlist",
+             "artist", "episode", "podcast"}
+
+
+def _real_artist(name):
+    return bool(name) and name.lower() not in _TYPEWORD and not _PLAYCOUNT.match(name)
+
+
 def artists_str(item):
-    return ", ".join(a["name"] for a in (item.get("artists") or []) if a.get("name"))
+    # get_home() song items pad the artists list with a type word ("Song") and a
+    # "<N> plays" token; keep only genuine artist names.
+    return ", ".join(a["name"] for a in (item.get("artists") or []) if _real_artist(a["name"]))
 
 
 def thumb_url(item):
     """Largest thumbnail URL (ytmusicapi lists them smallest-first)."""
     th = item.get("thumbnails") or []
     return th[-1]["url"] if th else ""
+
+
+def _video_id(url):
+    """videoId from a YT watch url; None for local file paths (no ?v=)."""
+    from urllib.parse import parse_qs, urlparse
+    return (parse_qs(urlparse(url).query).get("v") or [None])[0]
 
 
 def _track(item, album_title, fallback_artist):
@@ -60,6 +182,63 @@ def search_all(yt, query):
     return out
 
 
+def like_track(yt, track):
+    """Thumbs-up a track on YouTube Music. Returns True on success, False if
+    not a YT track / unauthed / request fails."""
+    if not (AUTHED and yt):
+        return False
+    vid = _video_id(track.get("url", "")) if track else None
+    if not vid:
+        return False
+    try:
+        yt.rate_song(vid, "LIKE")
+        return True
+    except Exception:
+        return False
+
+
+def record_history(yt, video_id, watched=30):
+    """Register a play in YouTube Music history the way the web player does:
+    a playback ping then a watchtime ping sharing one cpn. Watchtime is what
+    makes the play stick. Requires an authed (browser) YTMusic + history not
+    paused on the account. Raises on failure (caller swallows)."""
+    import random
+    _CPNA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    pt = yt.get_song(video_id)["playbackTracking"]
+    cpn = "".join(random.choice(_CPNA) for _ in range(16))
+    # length from the playback url so watchtime end never exceeds track length
+    from urllib.parse import parse_qs, urlparse
+    play_url = pt["videostatsPlaybackUrl"]["baseUrl"]
+    length = int((parse_qs(urlparse(play_url).query).get("len") or [watched])[0])
+    et = min(watched, length) if length else watched
+    yt._send_get_request(play_url, {"ver": 2, "c": "WEB_REMIX", "cpn": cpn})
+    yt._send_get_request(pt["videostatsWatchtimeUrl"]["baseUrl"],
+                         {"ver": 2, "c": "WEB_REMIX", "cpn": cpn,
+                          "st": "0", "et": str(et), "cmt": str(et)})
+
+
+def get_recs(yt, limit=5):
+    """Personalized YouTube Music home rows, flattened to `limit` playable
+    items. Each is a lazy album dict (tracks=None) resolved on open via the
+    stored raw item. Best-effort: any failure -> []."""
+    try:
+        rows = yt.get_home(limit=6)
+    except Exception:
+        return []
+    out = []
+    for row in rows:
+        for item in row.get("contents") or []:
+            if not (item.get("videoId") or item.get("browseId") or item.get("playlistId")):
+                continue  # header/shelf/artist -> not playable here
+            if not item.get("title"):
+                continue
+            out.append({"title": item["title"], "thumb": thumb_url(item),
+                        "tracks": None, "rec": item})
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def album_tracks(yt, browse_id):
     alb = yt.get_album(browse_id)
     fb = artists_str(alb)
@@ -68,8 +247,18 @@ def album_tracks(yt, browse_id):
 
 
 def resolve_result(yt, r):
-    """Search result -> (title, [tracks], thumb). album/playlist expand; song = 1."""
+    """Search result OR get_home() item -> (title, [tracks], thumb).
+    album/playlist expand; song = 1. Home items carry no resultType, so infer
+    it from which id field is present (videoId before playlistId: song 'radio'
+    items carry both)."""
     rt = r.get("resultType")
+    if rt is None:
+        if r.get("videoId"):
+            rt = "song"
+        elif str(r.get("browseId") or "").startswith("MPRE"):
+            rt = "album"
+        elif r.get("playlistId"):
+            rt = "playlist"
     if rt == "album":
         return album_tracks(yt, r["browseId"])
     if rt == "playlist":
@@ -210,6 +399,18 @@ def record(title, tracks, thumb=""):
 
 # ---- cmusfm scrobble bridge ------------------------------------------------
 
+def cmusfm_reset():
+    """Kill any stale cmusfm server; the next cmusfm call forks a fresh one.
+
+    cmusfm's daemon caches a Last.fm failure for 30 min (SERVICE_RETRY_DELAY) and
+    silently drops now-playing + scrobbles while in that state — after a
+    sleep/wake it can sit there for the rest of the session with no error
+    anywhere. Cheaper to start each msm session with a new daemon."""
+    # ponytail: blunt pkill. If you ever run cmus alongside msm, its in-flight
+    # track loses its scrobble — narrow to a socket health-check if that bites.
+    subprocess.run(["pkill", "-x", "cmusfm"], check=False)
+
+
 def cmusfm(status, track=None):
     """Fire cmusfm the way cmus does as status_display_program."""
     args = ["cmusfm", "status", status]
@@ -270,26 +471,48 @@ class IPC:
 class Player:
     """One background mpv for the whole session, driven over IPC."""
 
-    def __init__(self):
+    def __init__(self, yt=None):
+        self.yt = yt          # authed YTMusic -> record plays to YT history
         self.by_url = {}
         self.current = None
+        cmusfm_reset()
         if os.path.exists(MPV_SOCK):
             os.remove(MPV_SOCK)
         self.proc = subprocess.Popen(
             ["mpv", "--idle=yes", "--no-video", "--no-terminal",
+             "--log-file=" + MPV_LOG, "--msg-level=all=v",
              "--input-ipc-server=" + MPV_SOCK],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.ipc = IPC(self.proc)
         threading.Thread(target=self._watch, daemon=True).start()
 
     def play(self, tracks, start=0):
-        self.by_url = {t["url"]: t for t in tracks}
+        self.by_url = {tracks[0]["url"]: tracks[0]}
         self.ipc.cmd(["loadfile", tracks[0]["url"], "replace"])
-        for t in tracks[1:]:
-            self.ipc.cmd(["loadfile", t["url"], "append"])
+        self.enqueue(tracks[1:])
         if start:
             self.ipc.cmd(["set_property", "playlist-pos", start])
         self.ipc.cmd(["set_property", "pause", False])
+
+    def enqueue(self, tracks):
+        """Append tracks to the tail of the mpv playlist — they play after
+        whatever is already queued. Merges into by_url so the watch loop can
+        resolve queued tracks for scrobble/display."""
+        self.by_url.update({t["url"]: t for t in tracks})
+        for t in tracks:
+            self.ipc.cmd(["loadfile", t["url"], "append"])
+
+    def play_next(self, tracks):
+        """Insert tracks right after the current one (the rest of the queue is
+        left untouched). Returns the playlist index of the first inserted track,
+        or None if nothing is playing (caller should start playback instead)."""
+        pos = self.ipc.cmd(["get_property", "playlist-pos"])
+        if pos is None or pos < 0:
+            return None
+        self.by_url.update({t["url"]: t for t in tracks})
+        for i, t in enumerate(tracks):
+            self.ipc.cmd(["loadfile", t["url"], "insert-at", pos + 1 + i])
+        return pos + 1
 
     def toggle_pause(self):
         self.ipc.cmd(["cycle", "pause"])
@@ -317,12 +540,14 @@ class Player:
             self.proc.wait()
 
     def _watch(self):
-        """Own IPC connection; fire cmusfm on track/pause change."""
+        """Own IPC connection; fire cmusfm on track/pause change and record to
+        YouTube Music history once a track has played >=30s (like a scrobble)."""
         try:
             ipc = IPC(self.proc)
         except RuntimeError:
             return
         last_path = last_pause = None
+        recorded = False  # YT history logged for the current track yet?
         while self.proc.poll() is None:
             path = ipc.cmd(["get_property", "path"])
             pause = ipc.cmd(["get_property", "pause"])
@@ -330,12 +555,38 @@ class Player:
                 self.current = self.by_url.get(path)
                 if self.current:
                     cmusfm("playing", self.current)
-                last_path, last_pause = path, False
+                last_path, last_pause, recorded = path, False, False
             elif self.current and pause is not None and pause != last_pause:
                 cmusfm("paused" if pause else "playing", self.current)
                 last_pause = pause
+            if self.current and not recorded:
+                pos = ipc.cmd(["get_property", "time-pos"]) or 0
+                if pos >= 30:
+                    self._record_yt(self.current)
+                    recorded = True
             time.sleep(1)
         cmusfm("stopped", self.current)
+
+    def _record_yt(self, track, watched=30):
+        """Log a play to YouTube Music history (best-effort, off-thread so a
+        slow/hung request can't stall the watch loop). Local files are skipped.
+
+        Sends both the playback-start and watchtime pings with one shared cpn —
+        the watchtime ping is what actually registers the play (add_history_item
+        alone only fires playback, which YT often ignores)."""
+        if not (AUTHED and self.yt):
+            return
+        vid = _video_id(track["url"])
+        if not vid:
+            return
+
+        def go():
+            try:
+                record_history(self.yt, vid, watched)
+            except Exception:
+                pass  # region-locked / offline / token / history-paused -> skip
+
+        threading.Thread(target=go, daemon=True).start()
 
 
 # ---- minimal search CLI (TUI is the main app; this is a fallback) ----------
@@ -346,8 +597,8 @@ def main():
     for tool in ("mpv", "cmusfm"):
         if not shutil.which(tool):
             sys.exit("missing required tool: " + tool)
-    yt = YTMusic()
-    player = Player()
+    yt = get_yt()
+    player = Player(yt)
     print("ymc search — enter query, pick album, then n/p/space/q. Ctrl-C quits.")
     try:
         while True:

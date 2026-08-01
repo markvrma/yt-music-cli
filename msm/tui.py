@@ -7,12 +7,13 @@ Screens:
           album art (square, capped); bottom = progress bar.
   search  '/' opens it: type query, enter runs it, jk pick a result,
           enter = load into browse (no play), f = load + play, Esc = back.
-Keys: h/l switch pane, j/k move, space pause, n/p next/prev, q quit.
+Keys: h/l switch pane, j/k move, space pause, n/p next/prev, a queue,
+      A play-next, L like, q quit. Queue (a) = play after the whole queue;
+      play-next (A) = play right after the current track, queue untouched.
 """
 import curses
 import os
-
-from ytmusicapi import YTMusic
+import threading
 
 from . import ymc
 
@@ -85,19 +86,48 @@ def draw_rows(win, rows, sel, focused):
 
 # ---- album art (256-color half-block) --------------------------------------
 
+ART_PAIR0 = 10     # art color-pairs live at ART_PAIR0..COLOR_PAIRS-1
+ART_COLORS = 32    # adaptive palette size, stepped down if the cover needs more
+                   # (fg,bg) pairs than the terminal has
+GREY_GATE = 30     # max channel spread that may still snap to the grey ramp
+
 _art_pairs = {}
-_art_next = [10]
+_art_next = [ART_PAIR0]
+_art_owner = [None]   # path whose pairs are currently loaded
 _grid_cache = {}
+
+# xterm-256: the 6x6x6 cube levels are NOT evenly spaced, plus a 24-step grey ramp
+_CUBE = (0, 95, 135, 175, 215, 255)
+_CUBE_RGB = [(_CUBE[j // 36], _CUBE[j // 6 % 6], _CUBE[j % 6]) for j in range(216)]
+_GREY_RGB = [(8 + 10 * i,) * 3 for i in range(24)]
 
 
 def _xterm256(r, g, b):
-    return 16 + 36 * (r // 51) + 6 * (g // 51) + (b // 51)
+    """Nearest xterm-256 index. The old `//51` assumed evenly spaced cube levels
+    and never reached the grey ramp, so blacks came out as colored confetti.
+
+    Only near-neutral pixels may take the ramp, or it desaturates saturated
+    covers to mush. The gate is an absolute spread, not a saturation ratio: a
+    ratio sends dark hues to the cube, whose bottom step is a 0->95 cliff, and
+    shadowed foliage snaps to vivid (0,95,0).
+    """
+    pool = _CUBE_RGB if max(r, g, b) - min(r, g, b) > GREY_GATE else _CUBE_RGB + _GREY_RGB
+    i = min(range(len(pool)), key=lambda k: (pool[k][0] - r) ** 2 +
+            (pool[k][1] - g) ** 2 + (pool[k][2] - b) ** 2)
+    return 16 + i   # cube 0..215 -> 16..231, grey ramp 216..239 -> 232..255
+
+
+def _pair_budget():
+    """How many pairs the art may use. COLOR_PAIRS only exists after
+    start_color(); 256 is the floor (Apple's ncurses 5.7 reports exactly that,
+    which is why art ever ran out of pairs in the first place)."""
+    return min(getattr(curses, "COLOR_PAIRS", 256), 32000) - ART_PAIR0
 
 
 def _pair(fg, bg):
     key = (fg, bg)
     if key not in _art_pairs:
-        if _art_next[0] >= min(curses.COLOR_PAIRS, 32000):
+        if _art_next[0] - ART_PAIR0 >= _pair_budget():
             return 0  # out of pairs -> uncolored
         try:
             curses.init_pair(_art_next[0], fg, bg)
@@ -108,18 +138,42 @@ def _pair(fg, bg):
     return _art_pairs[key]
 
 
+def _quant_grid(img, cols, rows, colors):
+    """(fg,bg) per cell for an n-color adaptive palette of `img`.
+
+    FASTOCTREE, not MEDIANCUT: median cut weights the palette by pixel count, so
+    on a mostly-black cover a small vivid region (Daft Punk's gold helmet) gets
+    merged into the greys. Octree keeps distinct colors distinct.
+    """
+    from PIL import Image
+    q = img.quantize(colors=colors, method=Image.FASTOCTREE, dither=Image.NONE)
+    pal = q.getpalette()[:colors * 3]
+    xt = [_xterm256(*pal[i * 3:i * 3 + 3]) for i in range(len(pal) // 3)]
+    px = q.load()
+    return [[(xt[px[cx, cy * 2]], xt[px[cx, cy * 2 + 1]])
+             for cx in range(cols)] for cy in range(rows)]
+
+
 def _art_grid(path, cols, rows):
-    """Resize art to cols x 2*rows px (NEAREST = pixelated); (fg,bg) per cell.
-    Each cell is a half-block: 1px wide, 2px tall -> square when cols == 2*rows.
+    """Resize art to cols x 2*rows px, reduce to an adaptive palette, map to
+    xterm-256; (fg,bg) per cell. Each cell is a half-block: 1px wide, 2px tall ->
+    square when cols == 2*rows.
+
+    BOX (area average), not NEAREST: at this size NEAREST samples one source pixel
+    per cell, so detailed covers come out as noise. The palette steps down until
+    the cover's (fg,bg) combos fit the pair table; overrunning it renders as
+    uncolored half-blocks, i.e. black and white bars.
     """
     key = (path, cols, rows)
     if key in _grid_cache:
         return _grid_cache[key]
     from PIL import Image
-    img = Image.open(path).convert("RGB").resize((cols, rows * 2), Image.NEAREST)
-    px = img.load()
-    grid = [[(_xterm256(*px[cx, cy * 2]), _xterm256(*px[cx, cy * 2 + 1]))
-             for cx in range(cols)] for cy in range(rows)]
+    img = Image.open(path).convert("RGB").resize((cols, rows * 2), Image.BOX)
+    budget = _pair_budget()
+    for colors in (ART_COLORS, ART_COLORS // 2, 8):
+        grid = _quant_grid(img, cols, rows, colors)
+        if len({p for row in grid for p in row}) <= budget:
+            break
     _grid_cache[key] = grid
     return grid
 
@@ -138,6 +192,13 @@ def draw_art(win, path):
     except Exception:
         _put(win, h // 2, (w - 6) // 2, "no art", 6, curses.color_pair(DIM))
         return
+    if _art_owner[0] != (path, cols, rows):
+        # Only one cover is on screen at a time, so recycle the pair slots.
+        # Without this they leaked per album and a few covers in, every cell
+        # fell back to pair 0 -> uncolored half-blocks (black and white bars).
+        _art_pairs.clear()
+        _art_next[0] = ART_PAIR0
+        _art_owner[0] = (path, cols, rows)
     for cy in range(rows):
         for cx in range(cols):
             fg, bg = grid[cy][cx]
@@ -145,10 +206,11 @@ def draw_art(win, path):
             _put(win, 1 + cy, 1 + cx, "▀", 1, curses.color_pair(p) if p else 0)
 
 
-def draw_progress(stdscr, y, w, player):
+def draw_progress(stdscr, y, w, player, note=""):
     pos, dur, paused, title = player.progress()
     state = "‖" if paused else "▶"
-    win = box(stdscr, y, 0, 3, w, "%s %s" % (state, title), False)
+    label = note if note else "%s %s" % (state, title)
+    win = box(stdscr, y, 0, 3, w, label, False)
     if not win:
         return
     bw = w - 2
@@ -186,28 +248,114 @@ def run(stdscr, yt, player):
 
     hist = ymc.load_history()
     local = ymc.scan_local()
+    recs = []            # authed: YT Music recs, filled off-thread after first paint
     screen = "browse"
-    focus = 0            # 0=NowPlaying 1=Local 2=Last5  (search: 0=bar 1=results)
+    focus = 0            # 0=NowPlaying 1=Local 2=pane2  (search: 0=bar 1=results)
     sel = [0, 0, 0]      # per-pane selection
     sel_s = 0
     query = ""
     results = []
     now = {"album": None, "art": None}
 
+    if ymc.AUTHED:  # network call -> off-thread so it can't delay first paint
+        threading.Thread(target=lambda: recs.extend(ymc.get_recs(yt)),
+                          daemon=True).start()
+
+    def pane2():
+        """Active pane-2 list: YT recs when authed, else local last-5."""
+        return recs if ymc.AUTHED else hist
+
     def set_now(album):
+        # own copy of the track list: queued items append to the NOW pane
+        # (see the 'a' handler) without mutating the source album object
+        # shared by the LOCAL / FOR YOU / history lists.
+        if album and album.get("tracks") is not None:
+            album = {**album, "tracks": list(album["tracks"])}
         now["album"] = album
         now["art"] = art_for(album)
 
+    def ensure_tracks(album):
+        """Fill an album's tracks lazily (local scan or YT rec resolve). -> bool playable."""
+        if album.get("tracks") is None:
+            if album.get("local"):
+                ymc.load_local_album(album)
+            elif album.get("rec"):
+                try:
+                    _, tracks, thumb = ymc.resolve_result(yt, album["rec"])
+                except Exception:
+                    tracks = []
+                album["tracks"] = tracks
+                if tracks:
+                    album["thumb"] = thumb
+        return bool(album.get("tracks"))
+
+    def stamp_art(tracks, thumb):
+        """Tag each track with its album art so the cover can follow the
+        currently-playing track across queued albums (tracks carry no art
+        of their own)."""
+        for t in tracks:
+            t.setdefault("thumb", thumb or "")
+
     def do_play(album, start_idx=0):
         nonlocal hist
-        if album.get("local") and album.get("tracks") is None:
-            ymc.load_local_album(album)
+        if not ensure_tracks(album):
+            return
+        stamp_art(album["tracks"], album.get("thumb"))
         set_now(album)
         hist = ymc.record(album["title"], album["tracks"], album.get("thumb") or "")
         player.play(album["tracks"], start_idx)
 
+    def add_tracks(tracks, label, thumb="", mode="queue"):
+        """Add tracks to the current playlist and mirror them into the NOW
+        list. mode 'queue' = append to the tail; mode 'next' = insert right
+        after the current track (rest of the queue untouched). If nothing is
+        playing, start playback. Reused by the browse and search a/A keybinds."""
+        nonlocal flash, flash_ttl
+        stamp_art(tracks, thumb)
+        al = now["album"]
+        if not (al and al.get("tracks") is not None):
+            do_play({"title": label, "tracks": tracks, "thumb": thumb}, 0)
+            return
+        if mode == "next":
+            idx = player.play_next(tracks)
+            if idx is None:                       # playlist idle -> just start
+                do_play({"title": label, "tracks": tracks, "thumb": thumb}, 0)
+                return
+            al["tracks"][idx:idx] = tracks        # mirror insert into NOW list
+            flash, flash_ttl = "⏭ next: " + label, 6
+        else:
+            player.enqueue(tracks)
+            al["tracks"].extend(tracks)
+            flash, flash_ttl = "⏭ queued: " + label, 6
+
+    def cur_album():
+        """Album selected in the focused list pane (1=LOCAL, 2=FOR YOU/hist),
+        or None. Pane 0 (NOW) has no separate album to open."""
+        if focus == 1:
+            return local[sel[1]] if local else None
+        if focus == 2:
+            p2 = pane2()
+            return p2[sel[2]] if p2 else None
+        return None
+
     if hist:
         set_now(hist[0])
+
+    flash = ""       # transient status shown in the progress bar (e.g. "♥ liked")
+    flash_ttl = 0    # refresh cycles the flash stays visible
+    art_memo = {"url": None, "path": None}  # cover art of the playing track
+
+    def cur_art():
+        """Cover for the currently-playing track (follows it across queued
+        albums); falls back to the opened album's art when nothing plays."""
+        ct = player.current
+        if ct and ct.get("thumb"):
+            if ct["url"] != art_memo["url"]:
+                art_memo["url"] = ct["url"]
+                art_memo["path"] = art_for({"title": ct.get("album") or ct.get("title") or "art",
+                                            "thumb": ct["thumb"]})
+            return art_memo["path"]
+        return now["art"]
 
     while True:
         stdscr.erase()
@@ -242,23 +390,28 @@ def run(stdscr, yt, player):
                 draw_rows(wm, [a["title"] for a in local], sel[1], focus == 1)
 
             if rcw:
-                w5 = box(stdscr, 0, left_w, last5_h, rcw, "LAST 5  (enter=open f=play)", focus == 2)
+                p2 = pane2()
+                title2 = "FOR YOU  (enter=open f=play)" if ymc.AUTHED else "LAST 5  (enter=open f=play)"
+                w5 = box(stdscr, 0, left_w, last5_h, rcw, title2, focus == 2)
                 if w5:
-                    draw_rows(w5, [a["title"] for a in hist], sel[2], focus == 2)
+                    rows2 = [a["title"] for a in p2] or (["loading…"] if ymc.AUTHED else [])
+                    draw_rows(w5, rows2, sel[2], focus == 2)
                 wa = box(stdscr, main_h - art_bh, left_w, art_bh, art_bw, "cover", False)
                 if wa:
-                    draw_art(wa, now["art"])
+                    draw_art(wa, cur_art())
         else:  # search
             wb = box(stdscr, 0, 0, 3, W, "search", focus == 0)
             if wb:
                 _put(wb, 1, 1, " " + query + ("█" if focus == 0 else ""), W - 2,
                      curses.color_pair(ACCENT))
-            wr = box(stdscr, 3, 0, main_h - 3, W, "RESULTS  (enter=load f=play Esc=back)", focus == 1)
+            wr = box(stdscr, 3, 0, main_h - 3, W, "RESULTS  (enter=load f=play a=queue A=next Esc=back)", focus == 1)
             if wr:
                 draw_rows(wr, ["[%s] %s — %s" % (r.get("resultType", "?"), r.get("title", "?"),
                                ymc.artists_str(r)) for r in results], sel_s, focus == 1)
 
-        draw_progress(stdscr, main_h, W, player)
+        draw_progress(stdscr, main_h, W, player, flash if flash_ttl > 0 else "")
+        if flash_ttl > 0:
+            flash_ttl -= 1
         stdscr.refresh()
 
         c = stdscr.getch()
@@ -285,19 +438,22 @@ def run(stdscr, yt, player):
                     sel_s = clamp(sel_s + 1, 0, len(results) - 1)
                 elif c == ord("h"):
                     focus = 0
-                elif c in (curses.KEY_ENTER, 10, 13, ord("f")) and results:
+                elif c in (curses.KEY_ENTER, 10, 13, ord("f"), ord("a"), ord("A")) and results:
                     try:
                         title, tracks, thumb = ymc.resolve_result(yt, results[sel_s])
                     except Exception:
                         tracks = []
                     if tracks:
                         album = {"title": title, "tracks": tracks, "thumb": thumb}
-                        if c == ord("f"):
+                        if c in (ord("a"), ord("A")):  # stays in search
+                            add_tracks(tracks, title, thumb, "next" if c == ord("A") else "queue")
+                        elif c == ord("f"):
                             do_play(album, 0)
+                            screen, focus, sel[0] = "browse", 0, 0
                         else:
                             hist = ymc.record(title, tracks, thumb)
                             set_now(album)
-                        screen, focus, sel[0] = "browse", 0, 0
+                            screen, focus, sel[0] = "browse", 0, 0
             continue
 
         # ----- browse screen -----
@@ -316,42 +472,62 @@ def run(stdscr, yt, player):
         elif c == ord("l"):
             focus = min(2, focus + 1)
         elif c in (ord("j"), curses.KEY_DOWN):
-            n = _pane_len(focus, now, local, hist)
+            n = _pane_len(focus, now, local, pane2())
             sel[focus] = clamp(sel[focus] + 1, 0, n - 1)
         elif c in (ord("k"), curses.KEY_UP):
-            n = _pane_len(focus, now, local, hist)
+            n = _pane_len(focus, now, local, pane2())
             sel[focus] = clamp(sel[focus] - 1, 0, n - 1)
         elif c in (curses.KEY_ENTER, 10, 13):
             if focus == 0 and now["album"] and now["album"].get("tracks"):
                 do_play(now["album"], sel[0])
-            elif focus == 1 and local:
-                a = local[sel[1]]
-                if a.get("tracks") is None:
-                    ymc.load_local_album(a)
-                set_now(a)
-                focus, sel[0] = 0, 0
-            elif focus == 2 and hist:
-                set_now(hist[sel[2]])
-                focus, sel[0] = 0, 0
+            else:
+                a = cur_album()  # rec items resolve here; hist items no-op
+                if a and ensure_tracks(a):
+                    set_now(a)
+                    focus, sel[0] = 0, 0
         elif c == ord("f"):
             if focus == 0 and now["album"] and now["album"].get("tracks"):
                 do_play(now["album"], 0)
-            elif focus == 1 and local:
-                do_play(local[sel[1]], 0)
-                focus, sel[0] = 0, 0
-            elif focus == 2 and hist:
-                do_play(hist[sel[2]], 0)
-                focus, sel[0] = 0, 0
+            else:
+                a = cur_album()
+                if a:
+                    do_play(a, 0)
+                    focus, sel[0] = 0, 0
+        elif c in (ord("a"), ord("A")):  # a=queue at tail, A=play next
+            mode = "next" if c == ord("A") else "queue"
+            al = now["album"]
+            if focus == 0 and al and al.get("tracks"):
+                t = al["tracks"][sel[0]]
+                add_tracks([t], t["title"], t.get("thumb") or (al.get("thumb") or ""), mode)
+            else:
+                a = cur_album()
+                if a and ensure_tracks(a):
+                    add_tracks(list(a["tracks"]), a["title"], a.get("thumb") or "", mode)
+                elif a:
+                    flash, flash_ttl = "queue failed — run `msm auth`?", 8
+        elif c == ord("L"):  # shift+l: thumbs-up the highlighted (or playing) track
+            al = now["album"]
+            track = (al["tracks"][sel[0]] if focus == 0 and al and al.get("tracks")
+                     else player.current)
+            if not track:
+                flash, flash_ttl = "nothing to like", 6
+            elif ymc.like_track(yt, track):
+                flash, flash_ttl = "♥ liked: " + track["title"], 6
+            else:
+                flash, flash_ttl = "♥ like failed — run `msm auth` (session expired?)", 8
 
 
 def main():
     import shutil
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "auth":
+        ymc.setup_auth(sys.argv[2] if len(sys.argv) > 2 else None)
+        return
     for tool in ("mpv", "cmusfm"):
         if not shutil.which(tool):
             sys.exit("missing required tool: " + tool)
-    yt = YTMusic()
-    player = ymc.Player()
+    yt = ymc.get_yt()
+    player = ymc.Player(yt)
     try:
         curses.wrapper(run, yt, player)
     finally:

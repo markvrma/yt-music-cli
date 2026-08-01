@@ -30,6 +30,33 @@ msm
 
 (`python -m msm` also works.)
 
+## Sign in to YouTube Music (optional)
+
+Without sign-in, msm searches and plays anonymously. Sign in to record your
+plays to your YouTube Music listening history and get a personalized **FOR YOU**
+pane (replacing **Last 5**).
+
+msm uses ytmusicapi's *browser auth* — you paste the request headers from a
+logged-in `music.youtube.com` tab once. (YouTube's API rejects normal Google
+OAuth tokens for these endpoints, so this is the only method that works; no
+Google Cloud project needed.)
+
+```sh
+msm auth
+```
+
+Then, when prompted:
+
+1. Open <https://music.youtube.com> logged in, in your browser
+2. Open DevTools (⌥⌘I) → **Network** tab, filter for `/browse`
+3. Click any `POST` request → **Copy** → **Copy request headers**
+4. Paste into the terminal, then press **Ctrl-D**
+
+This writes `~/.config/ymc/browser.json` (chmod 600 — it holds your session
+cookies). Plays are recorded to YouTube Music once a track has played 30s
+(Last.fm scrobbling via cmusfm continues alongside). If recs/history stop
+working later, the session expired — just run `msm auth` again.
+
 ## Develop
 
 ```sh
@@ -53,7 +80,7 @@ Bordered panes, purple/grey theme.
 **browse** — five panes:
 - **Now Playing** (left, tall): tracklist of the opened album — `enter` plays a track, `f` plays the album from start
 - **Local ~/Music** (middle, tall): your local albums (one per subfolder) — `enter` opens its tracklist into Now Playing, `f` opens + plays
-- **Last 5** (top-right): recently played albums — `enter` opens into Now Playing, `f` opens + plays
+- **Last 5 / FOR YOU** (top-right): recently played albums, or — when signed in — personalized YouTube Music recommendations — `enter` opens into Now Playing, `f` opens + plays
 - **cover** (bottom-right): pixelated album art of the Now Playing album (square, 256-color half-block; local art from folder `cover.jpg`/`folder.jpg` or embedded tag)
 - progress bar (bottom, full width)
 
@@ -64,7 +91,7 @@ Opening an album (from Local or Last 5) loads its tracklist into **Now Playing**
 - `j`/`k` pick; `enter` loads into Now Playing (no play); `f` loads + plays; `Esc` back
 
 Keys: `h`/`l` switch pane (Now Playing ↔ Local ↔ Last 5) · `j`/`k` move · `enter` open/play ·
-`f` play from start · `space` pause · `n`/`p` next/prev · `/` search · `q` quit.
+`f` play from start · `space` pause · `n`/`p` next/prev · `shift`+`L` like current track (YT, signed in) · `/` search · `q` quit.
 
 Local albums use `ffprobe` for tags (title/artist/album/duration) and play straight from disk.
 Play history persists to `~/.config/ymc/history.json` (last 5 albums).

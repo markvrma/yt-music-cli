@@ -373,6 +373,13 @@ def run(stdscr, yt, player):
         return now["art"]
 
     while True:
+        # ponytail: blunt full repaint every cycle. curses only writes cells it
+        # believes changed, and two things desync that belief — a subprocess
+        # printing to the terminal, and init_pair reusing an art pair number
+        # under cells already drawn with it. Either leaves panes stale until
+        # something in them happens to change, which read as permanent blackout.
+        # Narrow to "on demand" if the redraw traffic ever matters over ssh.
+        stdscr.redrawwin()
         stdscr.erase()
         H, W = stdscr.getmaxyx()
         prog_h = 3

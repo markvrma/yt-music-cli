@@ -258,6 +258,22 @@ def test_art_never_falls_back_to_uncolored_pairs():
                 assert 16 <= fg <= 255 and 16 <= bg <= 255, (fg, bg)
 
 
+def test_dark_hues_keep_their_color():
+    """Dark blue and dark green must not snap to the grey ramp. The ramp is the
+    only fine gradation in xterm-256, so it wins on distance for any muted dark
+    color and covers rendered grey/black. Neutrals must still take the ramp."""
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as d:
+        for name, col, grey in (("navy", (25, 25, 60), False),
+                                ("green", (28, 52, 33), False),
+                                ("grey", (64, 64, 64), True)):
+            path = os.path.join(d, f"{name}.png")
+            Image.new("RGB", (90, 72), col).save(path)
+            tui._grid_cache.clear()
+            fg = tui._art_grid(path, 45, 18)[0][0][0]
+            assert (fg >= 232) == grey, (name, fg)
+
+
 def test_art_grid_fits_pair_budget_on_a_tiny_table():
     """A terminal with barely any pairs must still get a colored cover: the
     palette steps down until the (fg,bg) combos fit."""

@@ -3,6 +3,7 @@
 No network, no mpv, no terminal."""
 import curses
 import os
+import queue
 import subprocess
 import tempfile
 from unittest import mock
@@ -162,11 +163,13 @@ def test_enqueue_appends_and_merges_by_url():
     p = object.__new__(ymc.Player)  # bypass __init__ (spawns real mpv)
     p.ipc = StubIPC()
     p.by_url = {}
+    p.fetchq = queue.Queue()
     t1 = {"url": "u1", "title": "A"}
     t2 = {"url": "u2", "title": "B"}
     p.enqueue([t1, t2])
     assert p.ipc.cmds == [["loadfile", "u1", "append"], ["loadfile", "u2", "append"]]
     assert p.by_url == {"u1": t1, "u2": t2}   # queued tracks resolvable for scrobble
+    assert [p.fetchq.get_nowait() for _ in range(2)] == [t1, t2]  # download in order
 
 
 def test_play_next_inserts_after_current_in_order():
@@ -181,6 +184,7 @@ def test_play_next_inserts_after_current_in_order():
     p = object.__new__(ymc.Player)
     p.ipc = StubIPC(2)          # current track at playlist index 2
     p.by_url = {}
+    p.fetchq = queue.Queue()
     t1 = {"url": "u1", "title": "A"}
     t2 = {"url": "u2", "title": "B"}
     idx = p.play_next([t1, t2])
@@ -256,6 +260,22 @@ def test_art_never_falls_back_to_uncolored_pairs():
                 pair, fg, bg = call[0]
                 assert tui.ART_PAIR0 <= pair < budget, pair
                 assert 16 <= fg <= 255 and 16 <= bg <= 255, (fg, bg)
+
+
+def test_dark_hues_keep_their_color():
+    """Dark blue and dark green must not snap to the grey ramp. The ramp is the
+    only fine gradation in xterm-256, so it wins on distance for any muted dark
+    color and covers rendered grey/black. Neutrals must still take the ramp."""
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as d:
+        for name, col, grey in (("navy", (25, 25, 60), False),
+                                ("green", (28, 52, 33), False),
+                                ("grey", (64, 64, 64), True)):
+            path = os.path.join(d, f"{name}.png")
+            Image.new("RGB", (90, 72), col).save(path)
+            tui._grid_cache.clear()
+            fg = tui._art_grid(path, 45, 18)[0][0][0]
+            assert (fg >= 232) == grey, (name, fg)
 
 
 def test_art_grid_fits_pair_budget_on_a_tiny_table():

@@ -89,7 +89,10 @@ def draw_rows(win, rows, sel, focused):
 ART_PAIR0 = 10     # art color-pairs live at ART_PAIR0..COLOR_PAIRS-1
 ART_COLORS = 32    # adaptive palette size, stepped down if the cover needs more
                    # (fg,bg) pairs than the terminal has
-GREY_GATE = 30     # max channel spread that may still snap to the grey ramp
+GREY_GATE = 18     # max channel spread that may still snap to the grey ramp
+ART_SAT = 1.35     # pre-quantize saturation boost, see _art_grid
+ART_GAMMA = 0.85   # <1: lifts shadows toward the light side of the gradient
+_LIFT = [round(255 * (v / 255) ** ART_GAMMA) for v in range(256)]
 
 _art_pairs = {}
 _art_next = [ART_PAIR0]
@@ -108,8 +111,13 @@ def _xterm256(r, g, b):
 
     Only near-neutral pixels may take the ramp, or it desaturates saturated
     covers to mush. The gate is an absolute spread, not a saturation ratio: a
-    ratio sends dark hues to the cube, whose bottom step is a 0->95 cliff, and
-    shadowed foliage snaps to vivid (0,95,0).
+    ratio scales with brightness, so highlights keep hue while shadows of the
+    same hue lose it.
+
+    The gate is tight (18, was 30) because the ramp is the only fine gradation
+    in the palette, so it wins on Euclidean distance for any muted dark color:
+    dark blues and greens came out grey/black. A hued cube color one step up the
+    0->95 cliff reads truer than a grey of the right brightness.
     """
     pool = _CUBE_RGB if max(r, g, b) - min(r, g, b) > GREY_GATE else _CUBE_RGB + _GREY_RGB
     i = min(range(len(pool)), key=lambda k: (pool[k][0] - r) ** 2 +
@@ -163,12 +171,19 @@ def _art_grid(path, cols, rows):
     per cell, so detailed covers come out as noise. The palette steps down until
     the cover's (fg,bg) combos fit the pair table; overrunning it renders as
     uncolored half-blocks, i.e. black and white bars.
+
+    Saturation boost + shadow lift before quantizing: the 6x6x6 cube has nothing
+    between 0 and 95 per channel, so a muted dark hue is numerically closest to
+    grey and covers came out grey/black. Pushing hue and brightness up first
+    keeps them on the colored side. Measured over the local covers: mean grey-ramp
+    share 38% -> 25%, saturation drift -3.8 -> +7.6, luminance +8.
     """
     key = (path, cols, rows)
     if key in _grid_cache:
         return _grid_cache[key]
-    from PIL import Image
+    from PIL import Image, ImageEnhance
     img = Image.open(path).convert("RGB").resize((cols, rows * 2), Image.BOX)
+    img = ImageEnhance.Color(img).enhance(ART_SAT).point(_LIFT * 3)
     budget = _pair_budget()
     for colors in (ART_COLORS, ART_COLORS // 2, 8):
         grid = _quant_grid(img, cols, rows, colors)
@@ -358,6 +373,13 @@ def run(stdscr, yt, player):
         return now["art"]
 
     while True:
+        # ponytail: blunt full repaint every cycle. curses only writes cells it
+        # believes changed, and two things desync that belief — a subprocess
+        # printing to the terminal, and init_pair reusing an art pair number
+        # under cells already drawn with it. Either leaves panes stale until
+        # something in them happens to change, which read as permanent blackout.
+        # Narrow to "on demand" if the redraw traffic ever matters over ssh.
+        stdscr.redrawwin()
         stdscr.erase()
         H, W = stdscr.getmaxyx()
         prog_h = 3

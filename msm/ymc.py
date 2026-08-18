@@ -7,6 +7,7 @@ the terminal. cmusfm is fed the same way cmus feeds it as status_display_program
 import json
 import os
 import socket
+import queue
 import subprocess
 import threading
 import time
@@ -19,6 +20,8 @@ CONFIG = os.path.expanduser("~/.config/ymc")
 HIST = os.path.join(CONFIG, "history.json")
 AUTH = os.path.join(CONFIG, "browser.json")         # ytmusicapi browser-auth headers
 LOCAL_MUSIC = os.path.expanduser("~/Music")
+STREAM_CACHE = os.path.expanduser("~/.cache/msm")
+COOKIE_BROWSER = os.environ.get("MSM_COOKIE_BROWSER", "chrome")
 ART_CACHE = os.path.join(CONFIG, "art")
 AUDIO_EXT = (".mp3", ".flac", ".m4a", ".opus", ".ogg", ".wav", ".aac", ".wma")
 
@@ -425,6 +428,40 @@ def cmusfm(status, track=None):
     subprocess.run(args, check=False)
 
 
+def cache_path(track):
+    """Local file mpv will play for a YouTube track (local files pass through).
+
+    googlevideo now 403s any open-ended `Range: bytes=0-`, which is the only
+    request ffmpeg knows how to make, so mpv cannot stream YouTube at all —
+    album art loaded but playback and duration never did. yt-dlp fetches in
+    bounded chunks, so it downloads and mpv plays the file.
+    """
+    # ponytail: itag 140 only (m4a, 130k) so the path is known before the
+    # download finishes and mpv can be queued up front. If YouTube stops
+    # serving 140, widen the format and glob for the extension instead.
+    vid = _video_id(track["url"])
+    return os.path.join(STREAM_CACHE, vid + ".m4a") if vid else track["url"]
+
+
+def fetch(track):
+    """Download the track into the cache if it is not there yet. -> local path."""
+    path = cache_path(track)
+    if path == track["url"] or os.path.exists(path):
+        return path
+    os.makedirs(STREAM_CACHE, exist_ok=True)
+    # no --no-part: a killed download leaves a .part file, not a truncated
+    # cache hit that would play as a few seconds of silence forever after.
+    # The web client is the only one still handing out a full-length URL, and
+    # it needs both a signed-in cookie jar and a PO token provider — without
+    # them googlevideo serves the first ~1MB and then 403s.
+    subprocess.run(["yt-dlp", "-q", "--no-warnings", "-f", "140",
+                    "--cookies-from-browser", COOKIE_BROWSER,
+                    "--extractor-args", "youtube:player_client=web",
+                    "-o", path, track["url"]], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return path
+
+
 # ---- mpv IPC ---------------------------------------------------------------
 
 class IPC:
@@ -484,11 +521,21 @@ class Player:
              "--input-ipc-server=" + MPV_SOCK],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.ipc = IPC(self.proc)
+        self.fetchq = queue.Queue()
+        threading.Thread(target=self._fetcher, daemon=True).start()
         threading.Thread(target=self._watch, daemon=True).start()
 
+    def _fetcher(self):
+        """Download queued tracks in playlist order, well ahead of playback."""
+        while True:
+            fetch(self.fetchq.get())
+
     def play(self, tracks, start=0):
-        self.by_url = {tracks[0]["url"]: tracks[0]}
-        self.ipc.cmd(["loadfile", tracks[0]["url"], "replace"])
+        fetch(tracks[0])      # mpv starts on it before playlist-pos is set
+        if start:
+            fetch(tracks[start])  # the rest download in the background
+        self.by_url = {cache_path(tracks[0]): tracks[0]}
+        self.ipc.cmd(["loadfile", cache_path(tracks[0]), "replace"])
         self.enqueue(tracks[1:])
         if start:
             self.ipc.cmd(["set_property", "playlist-pos", start])
@@ -498,9 +545,10 @@ class Player:
         """Append tracks to the tail of the mpv playlist — they play after
         whatever is already queued. Merges into by_url so the watch loop can
         resolve queued tracks for scrobble/display."""
-        self.by_url.update({t["url"]: t for t in tracks})
+        self.by_url.update({cache_path(t): t for t in tracks})
         for t in tracks:
-            self.ipc.cmd(["loadfile", t["url"], "append"])
+            self.fetchq.put(t)
+            self.ipc.cmd(["loadfile", cache_path(t), "append"])
 
     def play_next(self, tracks):
         """Insert tracks right after the current one (the rest of the queue is
@@ -509,9 +557,10 @@ class Player:
         pos = self.ipc.cmd(["get_property", "playlist-pos"])
         if pos is None or pos < 0:
             return None
-        self.by_url.update({t["url"]: t for t in tracks})
+        self.by_url.update({cache_path(t): t for t in tracks})
         for i, t in enumerate(tracks):
-            self.ipc.cmd(["loadfile", t["url"], "insert-at", pos + 1 + i])
+            self.fetchq.put(t)
+            self.ipc.cmd(["loadfile", cache_path(t), "insert-at", pos + 1 + i])
         return pos + 1
 
     def toggle_pause(self):
@@ -594,7 +643,7 @@ class Player:
 def main():
     import shutil
     import sys
-    for tool in ("mpv", "cmusfm"):
+    for tool in ("mpv", "cmusfm", "yt-dlp"):
         if not shutil.which(tool):
             sys.exit("missing required tool: " + tool)
     yt = get_yt()

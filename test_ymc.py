@@ -3,6 +3,7 @@
 No network, no mpv, no terminal."""
 import curses
 import os
+import queue
 import subprocess
 import tempfile
 from unittest import mock
@@ -162,11 +163,13 @@ def test_enqueue_appends_and_merges_by_url():
     p = object.__new__(ymc.Player)  # bypass __init__ (spawns real mpv)
     p.ipc = StubIPC()
     p.by_url = {}
+    p.fetchq = queue.Queue()
     t1 = {"url": "u1", "title": "A"}
     t2 = {"url": "u2", "title": "B"}
     p.enqueue([t1, t2])
     assert p.ipc.cmds == [["loadfile", "u1", "append"], ["loadfile", "u2", "append"]]
     assert p.by_url == {"u1": t1, "u2": t2}   # queued tracks resolvable for scrobble
+    assert [p.fetchq.get_nowait() for _ in range(2)] == [t1, t2]  # download in order
 
 
 def test_play_next_inserts_after_current_in_order():
@@ -181,6 +184,7 @@ def test_play_next_inserts_after_current_in_order():
     p = object.__new__(ymc.Player)
     p.ipc = StubIPC(2)          # current track at playlist index 2
     p.by_url = {}
+    p.fetchq = queue.Queue()
     t1 = {"url": "u1", "title": "A"}
     t2 = {"url": "u2", "title": "B"}
     idx = p.play_next([t1, t2])

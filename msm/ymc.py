@@ -566,6 +566,25 @@ class Player:
     def toggle_pause(self):
         self.ipc.cmd(["cycle", "pause"])
 
+    def toggle_loop(self):
+        """Repeat-all: after the last track mpv restarts at track 1.
+
+        The setting is a global mpv option, so it survives the `loadfile
+        replace` in play() -- a new album inherits it -- and it makes
+        playlist-next/prev wrap around the ends of the playlist.
+        """
+        # ponytail: mpv's own cycle-values, not a read-modify-write. Plain
+        # `cycle` would walk loop-playlist's other choices (force/N too);
+        # cycle-values pins the two we want.
+        self.ipc.cmd(["cycle-values", "loop-playlist", "inf", "no"])
+
+    def looping(self):
+        """True while repeat-all is on. mpv answers False for off and the
+        string 'inf' for on (never 'no'), so truthiness is enough. An IPC
+        failure also reads False -- the indicator under-reports, never lies
+        the other way."""
+        return bool(self.ipc.cmd(["get_property", "loop-playlist"]))
+
     def next(self):
         self.ipc.cmd(["playlist-next"])
 

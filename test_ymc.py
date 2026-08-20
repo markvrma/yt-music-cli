@@ -207,6 +207,35 @@ def test_play_next_returns_none_when_idle():
     assert p.by_url == {}       # nothing queued when idle
 
 
+def test_toggle_loop_uses_cycle_values():
+    class StubIPC:
+        def __init__(self):
+            self.cmds = []
+
+        def cmd(self, c):
+            self.cmds.append(c)
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC()
+    p.toggle_loop()
+    # cycle-values pins the two states; plain `cycle` would walk force/N too
+    assert p.ipc.cmds == [["cycle-values", "loop-playlist", "inf", "no"]]
+
+
+def test_looping_reads_mpvs_reply_shapes():
+    """mpv answers False for off and the string 'inf' for on; IPC.cmd answers
+    None on any failure. Verified live against mpv v0.41.0."""
+    class StubIPC:
+        def __init__(self, reply):
+            self.reply = reply
+
+        def cmd(self, c):
+            return self.reply
+    for reply, want in ((False, False), ("inf", True), (None, False)):
+        p = object.__new__(ymc.Player)
+        p.ipc = StubIPC(reply)
+        assert p.looping() is want, reply
+
+
 def _cover(path, kind):
     """Two shapes of cover: a busy one with no separable background, and a
     clean black background with one bright object."""

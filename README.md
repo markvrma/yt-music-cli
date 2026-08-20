@@ -91,7 +91,12 @@ Opening an album (from Local or Last 5) loads its tracklist into **Now Playing**
 - `j`/`k` pick; `enter` loads into Now Playing (no play); `f` loads + plays; `Esc` back
 
 Keys: `h`/`l` switch pane (Now Playing ↔ Local ↔ Last 5) · `j`/`k` move · `enter` open/play ·
-`f` play from start · `space` pause · `n`/`p` next/prev · `shift`+`L` like current track (YT, signed in) · `/` search · `q` quit.
+`f` play from start · `space` pause · `n`/`p` next/prev · `a` queue · `shift`+`A` play next ·
+`r` repeat-all · `shift`+`L` like current track (YT, signed in) · `/` search · `q` quit.
+
+`r` toggles repeat-all: after the last track playback restarts at track 1, `↻` shows in the
+progress bar, `n`/`p` wrap around the ends, and the next album played inherits the setting.
+Like `space`/`n`/`p` it works on the browse screen, not inside search results.
 
 Local albums use `ffprobe` for tags (title/artist/album/duration) and play straight from disk.
 Play history persists to `~/.config/ymc/history.json` (last 5 albums).

@@ -5,6 +5,11 @@ via `mpv`, scrobble each track through `cmusfm` (same protocol cmus uses as
 its status_display_program). mpv runs in the background driven over its JSON
 IPC socket, so the TUI owns the terminal.
 
+<p align="center">
+  <img src="docs/screenshot-browse.png" width="48%" alt="browse screen: Now Playing tracklist, Local ~/Music, Last 5, pixelated cover art">
+  <img src="docs/screenshot-search.png" width="48%" alt="search screen: results tagged song/album/playlist, ranked by relevance">
+</p>
+
 ## System requirements (not pip-installable — install separately)
 
 - `mpv`, `yt-dlp`, `cmusfm`, `ffmpeg`/`ffprobe` on PATH (ffprobe reads local tags; ffmpeg extracts embedded art)

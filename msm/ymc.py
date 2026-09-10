@@ -409,9 +409,14 @@ def cmusfm_reset():
     silently drops now-playing + scrobbles while in that state — after a
     sleep/wake it can sit there for the rest of the session with no error
     anywhere. Cheaper to start each msm session with a new daemon."""
+    # SIGKILL, not SIGTERM: a TERM'd server unblocks its poll() but then hangs
+    # in the curl teardown with the listening socket still open, so
+    # cmusfm_server_check() keeps connecting to a corpse and every status
+    # message is silently dropped. The leftover socket file is harmless — a
+    # fresh server unlinks it before bind.
     # ponytail: blunt pkill. If you ever run cmus alongside msm, its in-flight
     # track loses its scrobble — narrow to a socket health-check if that bites.
-    subprocess.run(["pkill", "-x", "cmusfm"], check=False)
+    subprocess.run(["pkill", "-9", "-x", "cmusfm"], check=False)
 
 
 def cmusfm(status, track=None):
@@ -425,7 +430,13 @@ def cmusfm(status, track=None):
             "title", track["title"],
             "duration", str(track["duration"]),
         ]
-    subprocess.run(args, check=False)
+    # start_new_session: the daemon is forked by *this* client, so without a
+    # new session it lands in msm's process group and Ctrl+Z on msm freezes it
+    # too. A stopped daemon is the worst failure mode there is: connect() to
+    # its listening socket still succeeds, so cmusfm_server_check() calls it
+    # healthy and every later status message is written into a socket nobody
+    # reads — no error, exit 0, nothing scrobbled.
+    subprocess.run(args, check=False, start_new_session=True)
 
 
 def cache_path(track):
@@ -615,23 +626,35 @@ class Player:
         except RuntimeError:
             return
         last_path = last_pause = None
+        last_pos = 0
         recorded = False  # YT history logged for the current track yet?
         while self.proc.poll() is None:
             path = ipc.cmd(["get_property", "path"])
             pause = ipc.cmd(["get_property", "pause"])
-            if path and path != last_path:
+            raw = ipc.cmd(["get_property", "time-pos"])
+            pos = raw or 0
+            # Repeat-all over a one-track playlist replays the same file, so
+            # `path` never changes and cmusfm would never hear about the play
+            # that just finished. A rewind is the only signal left. Nothing
+            # seeks backwards in msm, so this cannot be a user scrub.
+            replayed = raw is not None and path == last_path and pos + 2 < last_pos
+            if path and (path != last_path or replayed):
                 self.current = self.by_url.get(path)
                 if self.current:
                     cmusfm("playing", self.current)
                 last_path, last_pause, recorded = path, False, False
+            elif last_path and not path:
+                # Playlist ran out: mpv idles instead of exiting, so without an
+                # explicit stop cmusfm sits on the last track and never submits it.
+                cmusfm("stopped", self.current)
+                last_path, self.current = None, None
             elif self.current and pause is not None and pause != last_pause:
                 cmusfm("paused" if pause else "playing", self.current)
                 last_pause = pause
-            if self.current and not recorded:
-                pos = ipc.cmd(["get_property", "time-pos"]) or 0
-                if pos >= 30:
-                    self._record_yt(self.current)
-                    recorded = True
+            last_pos = pos
+            if self.current and not recorded and pos >= 30:
+                self._record_yt(self.current)
+                recorded = True
             time.sleep(1)
         cmusfm("stopped", self.current)
 

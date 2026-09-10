@@ -318,6 +318,48 @@ def test_art_grid_fits_pair_budget_on_a_tiny_table():
     assert len(pairs) <= 80 - tui.ART_PAIR0, len(pairs)
     assert len({fg for fg, _ in pairs}) > 1, "art collapsed to a single color"
 
+def test_watch_rescrobbles_a_replayed_track_and_stops_at_playlist_end():
+    """repeat-all over one track keeps mpv's `path` constant, so the rewind is
+    the only cue cmusfm gets; and an exhausted playlist leaves mpv idling, so
+    the last track needs an explicit stop or it is never submitted."""
+    # (path, pause, time-pos) per one-second poll of the watch loop
+    frames = [("u1", False, 5), ("u1", False, 190), ("u1", False, 1), (None, None, None)]
+
+    class StubIPC:
+        def __init__(self):
+            self.i = -1
+
+        def cmd(self, c):
+            prop = c[1]
+            if prop == "path":
+                self.i += 1
+            f = frames[min(self.i, len(frames) - 1)]
+            return {"path": f[0], "pause": f[1], "time-pos": f[2]}[prop]
+
+    class StubProc:
+        def __init__(self):
+            self.n = 0
+
+        def poll(self):
+            self.n += 1
+            return None if self.n <= len(frames) else 0
+
+    t1 = {"url": "u1", "title": "A", "artist": "B", "album": "C", "duration": 198}
+    p = object.__new__(ymc.Player)
+    p.by_url, p.current, p.proc, p.yt = {"u1": t1}, None, StubProc(), None
+    calls = []
+    with mock.patch.object(ymc, "IPC", lambda proc: StubIPC()), \
+         mock.patch.object(ymc, "cmusfm",
+                           lambda s, t=None: calls.append((s, t and t["title"]))), \
+         mock.patch("time.sleep"):
+        p._watch()
+    assert calls == [
+        ("playing", "A"),   # first start
+        ("playing", "A"),   # rewind == replay -> submits the play that finished
+        ("stopped", "A"),   # playlist ran out while mpv stayed alive
+        ("stopped", None),  # mpv gone
+    ], calls
+
 
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):

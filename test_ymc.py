@@ -236,6 +236,49 @@ def test_looping_reads_mpvs_reply_shapes():
         assert p.looping() is want, reply
 
 
+def test_toggle_left_ear_uses_af_toggle():
+    class StubIPC:
+        def __init__(self):
+            self.cmds = []
+
+        def cmd(self, c):
+            self.cmds.append(c)
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC()
+    p.toggle_left_ear()
+    # `af toggle` is add-if-absent / drop-if-present, so no flag to keep in sync
+    assert p.ipc.cmds == [["af", "toggle", "lavfi=[pan=stereo|c0=0.5*c0+0.5*c1|c1=0*c0]"]]
+
+
+def test_left_ear_filter_graph_is_valid_ffmpeg():
+    """The filter string only fails when the graph is built -- at playback,
+    not at toggle -- so an invalid one looks like a dead key. Build it here."""
+    import shutil
+    if not shutil.which("ffmpeg"):
+        return
+    af = ymc.Player.LEFT_EAR_AF[len("lavfi=["):-1]
+    r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi",
+                        "-i", "anullsrc=channel_layout=stereo", "-af", af,
+                        "-t", "0.1", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_left_ear_reads_filter_chain():
+    """mpv answers [] for an empty chain and a list of filter dicts when the
+    pan filter is on; IPC.cmd answers None on any failure."""
+    class StubIPC:
+        def __init__(self, reply):
+            self.reply = reply
+
+        def cmd(self, c):
+            return self.reply
+    for reply, want in (([], False), ([{"name": "pan"}], True), (None, False)):
+        p = object.__new__(ymc.Player)
+        p.ipc = StubIPC(reply)
+        assert p.left_ear() is want, reply
+
+
 def _cover(path, kind):
     """Two shapes of cover: a busy one with no separable background, and a
     clean black background with one bright object."""

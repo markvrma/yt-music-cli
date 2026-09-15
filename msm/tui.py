@@ -8,7 +8,7 @@ Screens:
   search  '/' opens it: type query, enter runs it, jk pick a result,
           enter = load into browse (no play), f = load + play, Esc = back.
 Keys: h/l switch pane, j/k move, space pause, n/p next/prev, a queue,
-      A play-next, r repeat-all, L like, q quit. Queue (a) = play after the
+      A play-next, r repeat-all, e left-ear, L like, q quit. Queue (a) = play after the
       whole queue; play-next (A) = play right after the current track, queue
       untouched. Repeat-all (r, browse screen only) restarts at track 1 after
       the last one; while it is on n/p wrap around the ends, and the next
@@ -228,7 +228,8 @@ def draw_progress(stdscr, y, w, player, note=""):
     pos, dur, paused, title = player.progress()
     state = "‖" if paused else "▶"
     # loop glyph only on the real label -- never stapled onto a flash message
-    label = note if note else ("↻ " if player.looping() else "") + "%s %s" % (state, title)
+    flags = ("↻ " if player.looping() else "") + ("◐ " if player.left_ear() else "")
+    label = note if note else flags + "%s %s" % (state, title)
     win = box(stdscr, y, 0, 3, w, label, False)
     if not win:
         return
@@ -495,6 +496,8 @@ def run(stdscr, yt, player):
             player.prev()
         elif c == ord("r"):  # repeat-all; ↻ in the progress bar shows the state
             player.toggle_loop()
+        elif c == ord("e"):  # left-ear-only; ◐ in the progress bar shows it
+            player.toggle_left_ear()
         elif c == ord("h"):
             focus = max(0, focus - 1)
         elif c == ord("l"):

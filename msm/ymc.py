@@ -596,6 +596,29 @@ class Player:
         the other way."""
         return bool(self.ipc.cmd(["get_property", "loop-playlist"]))
 
+    # Both channels folded into the left one, right muted. Halved so the
+    # fold-down cannot clip. Two syntax traps, both verified live against mpv
+    # v0.41.0 + libavfilter 11: a bare pan=... trips mpv's own arg parser on
+    # the | separators (hence lavfi=[...]), and the mute has to be 0*c0, not
+    # 0 -- ffmpeg wants a channel name in every term. Neither shows up until
+    # the filter graph is built, which happens at playback, not at toggle.
+    LEFT_EAR_AF = "lavfi=[pan=stereo|c0=0.5*c0+0.5*c1|c1=0*c0]"
+
+    def toggle_left_ear(self):
+        """Left-ear-only mode: music sits in the left bud, right stays free
+        for everything else on the machine.
+
+        ponytail: mpv's own `af toggle` -- it adds the filter if absent and
+        drops it if present, so no mirrored flag here to drift out of sync.
+        """
+        self.ipc.cmd(["af", "toggle", self.LEFT_EAR_AF])
+
+    def left_ear(self):
+        """True while left-ear-only is on. pan is the only filter we ever
+        add, so a non-empty chain means it is on; an IPC failure reads False
+        -- the indicator under-reports, never lies the other way."""
+        return bool(self.ipc.cmd(["get_property", "af"]))
+
     def next(self):
         self.ipc.cmd(["playlist-next"])
 

@@ -613,6 +613,19 @@ class Player:
         """
         self.ipc.cmd(["af", "toggle", self.LEFT_EAR_AF])
 
+    def volume(self, delta):
+        """Nudge mpv's own software volume -- this player only, the system
+        mixer and every other app are untouched. It is a global mpv option,
+        so it survives the `loadfile replace` in play(). mpv clamps to
+        --volume-max (130 by default) on its own."""
+        self.ipc.cmd(["add", "volume", delta])
+
+    def volume_pct(self):
+        """Current volume as a whole percent. An IPC failure reads 100 -- the
+        indicator then just matches mpv's own default."""
+        v = self.ipc.cmd(["get_property", "volume"])
+        return 100 if v is None else int(v)
+
     def left_ear(self):
         """True while left-ear-only is on. pan is the only filter we ever
         add, so a non-empty chain means it is on; an IPC failure reads False

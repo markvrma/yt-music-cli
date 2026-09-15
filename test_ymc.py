@@ -250,6 +250,26 @@ def test_toggle_left_ear_uses_af_toggle():
     assert p.ipc.cmds == [["af", "toggle", "lavfi=[pan=stereo|c0=0.5*c0+0.5*c1|c1=0*c0]"]]
 
 
+def test_volume_steps_and_reads_back():
+    class StubIPC:
+        def __init__(self, reply=None):
+            self.cmds, self.reply = [], reply
+
+        def cmd(self, c):
+            self.cmds.append(c)
+            return self.reply
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC()
+    p.volume(-5)
+    p.volume(5)
+    # relative `add`, so mpv owns the clamping against --volume-max
+    assert p.ipc.cmds == [["add", "volume", -5], ["add", "volume", 5]]
+    for reply, want in ((100.0, 100), (85.0, 85), (None, 100)):
+        p = object.__new__(ymc.Player)
+        p.ipc = StubIPC(reply)
+        assert p.volume_pct() == want, reply
+
+
 def test_left_ear_filter_graph_is_valid_ffmpeg():
     """The filter string only fails when the graph is built -- at playback,
     not at toggle -- so an invalid one looks like a dead key. Build it here."""

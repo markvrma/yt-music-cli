@@ -207,6 +207,98 @@ def test_play_next_returns_none_when_idle():
     assert p.by_url == {}       # nothing queued when idle
 
 
+def test_toggle_loop_uses_cycle_values():
+    class StubIPC:
+        def __init__(self):
+            self.cmds = []
+
+        def cmd(self, c):
+            self.cmds.append(c)
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC()
+    p.toggle_loop()
+    # cycle-values pins the two states; plain `cycle` would walk force/N too
+    assert p.ipc.cmds == [["cycle-values", "loop-playlist", "inf", "no"]]
+
+
+def test_looping_reads_mpvs_reply_shapes():
+    """mpv answers False for off and the string 'inf' for on; IPC.cmd answers
+    None on any failure. Verified live against mpv v0.41.0."""
+    class StubIPC:
+        def __init__(self, reply):
+            self.reply = reply
+
+        def cmd(self, c):
+            return self.reply
+    for reply, want in ((False, False), ("inf", True), (None, False)):
+        p = object.__new__(ymc.Player)
+        p.ipc = StubIPC(reply)
+        assert p.looping() is want, reply
+
+
+def test_toggle_left_ear_uses_af_toggle():
+    class StubIPC:
+        def __init__(self):
+            self.cmds = []
+
+        def cmd(self, c):
+            self.cmds.append(c)
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC()
+    p.toggle_left_ear()
+    # `af toggle` is add-if-absent / drop-if-present, so no flag to keep in sync
+    assert p.ipc.cmds == [["af", "toggle", "lavfi=[pan=stereo|c0=0.5*c0+0.5*c1|c1=0*c0]"]]
+
+
+def test_volume_steps_and_reads_back():
+    class StubIPC:
+        def __init__(self, reply=None):
+            self.cmds, self.reply = [], reply
+
+        def cmd(self, c):
+            self.cmds.append(c)
+            return self.reply
+    p = object.__new__(ymc.Player)
+    p.ipc = StubIPC()
+    p.volume(-5)
+    p.volume(5)
+    # relative `add`, so mpv owns the clamping against --volume-max
+    assert p.ipc.cmds == [["add", "volume", -5], ["add", "volume", 5]]
+    for reply, want in ((100.0, 100), (85.0, 85), (None, 100)):
+        p = object.__new__(ymc.Player)
+        p.ipc = StubIPC(reply)
+        assert p.volume_pct() == want, reply
+
+
+def test_left_ear_filter_graph_is_valid_ffmpeg():
+    """The filter string only fails when the graph is built -- at playback,
+    not at toggle -- so an invalid one looks like a dead key. Build it here."""
+    import shutil
+    if not shutil.which("ffmpeg"):
+        return
+    af = ymc.Player.LEFT_EAR_AF[len("lavfi=["):-1]
+    r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi",
+                        "-i", "anullsrc=channel_layout=stereo", "-af", af,
+                        "-t", "0.1", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_left_ear_reads_filter_chain():
+    """mpv answers [] for an empty chain and a list of filter dicts when the
+    pan filter is on; IPC.cmd answers None on any failure."""
+    class StubIPC:
+        def __init__(self, reply):
+            self.reply = reply
+
+        def cmd(self, c):
+            return self.reply
+    for reply, want in (([], False), ([{"name": "pan"}], True), (None, False)):
+        p = object.__new__(ymc.Player)
+        p.ipc = StubIPC(reply)
+        assert p.left_ear() is want, reply
+
+
 def _cover(path, kind):
     """Two shapes of cover: a busy one with no separable background, and a
     clean black background with one bright object."""
@@ -288,6 +380,48 @@ def test_art_grid_fits_pair_budget_on_a_tiny_table():
     pairs = {p for row in grid for p in row}
     assert len(pairs) <= 80 - tui.ART_PAIR0, len(pairs)
     assert len({fg for fg, _ in pairs}) > 1, "art collapsed to a single color"
+
+def test_watch_rescrobbles_a_replayed_track_and_stops_at_playlist_end():
+    """repeat-all over one track keeps mpv's `path` constant, so the rewind is
+    the only cue cmusfm gets; and an exhausted playlist leaves mpv idling, so
+    the last track needs an explicit stop or it is never submitted."""
+    # (path, pause, time-pos) per one-second poll of the watch loop
+    frames = [("u1", False, 5), ("u1", False, 190), ("u1", False, 1), (None, None, None)]
+
+    class StubIPC:
+        def __init__(self):
+            self.i = -1
+
+        def cmd(self, c):
+            prop = c[1]
+            if prop == "path":
+                self.i += 1
+            f = frames[min(self.i, len(frames) - 1)]
+            return {"path": f[0], "pause": f[1], "time-pos": f[2]}[prop]
+
+    class StubProc:
+        def __init__(self):
+            self.n = 0
+
+        def poll(self):
+            self.n += 1
+            return None if self.n <= len(frames) else 0
+
+    t1 = {"url": "u1", "title": "A", "artist": "B", "album": "C", "duration": 198}
+    p = object.__new__(ymc.Player)
+    p.by_url, p.current, p.proc, p.yt = {"u1": t1}, None, StubProc(), None
+    calls = []
+    with mock.patch.object(ymc, "IPC", lambda proc: StubIPC()), \
+         mock.patch.object(ymc, "cmusfm",
+                           lambda s, t=None: calls.append((s, t and t["title"]))), \
+         mock.patch("time.sleep"):
+        p._watch()
+    assert calls == [
+        ("playing", "A"),   # first start
+        ("playing", "A"),   # rewind == replay -> submits the play that finished
+        ("stopped", "A"),   # playlist ran out while mpv stayed alive
+        ("stopped", None),  # mpv gone
+    ], calls
 
 
 if __name__ == "__main__":

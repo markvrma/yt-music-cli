@@ -8,8 +8,11 @@ Screens:
   search  '/' opens it: type query, enter runs it, jk pick a result,
           enter = load into browse (no play), f = load + play, Esc = back.
 Keys: h/l switch pane, j/k move, space pause, n/p next/prev, a queue,
-      A play-next, L like, q quit. Queue (a) = play after the whole queue;
-      play-next (A) = play right after the current track, queue untouched.
+      A play-next, r repeat-all, e left-ear, [ ] volume, L like, q quit. Queue (a) = play after the
+      whole queue; play-next (A) = play right after the current track, queue
+      untouched. Repeat-all (r, browse screen only) restarts at track 1 after
+      the last one; while it is on n/p wrap around the ends, and the next
+      album played inherits the setting. ↻ in the progress bar = on.
 """
 import curses
 import os
@@ -224,7 +227,11 @@ def draw_art(win, path):
 def draw_progress(stdscr, y, w, player, note=""):
     pos, dur, paused, title = player.progress()
     state = "‖" if paused else "▶"
-    label = note if note else "%s %s" % (state, title)
+    # loop glyph only on the real label -- never stapled onto a flash message
+    vol = player.volume_pct()
+    flags = ("↻ " if player.looping() else "") + ("◐ " if player.left_ear() else "") \
+            + ("" if vol == 100 else "%d%% " % vol)
+    label = note if note else flags + "%s %s" % (state, title)
     win = box(stdscr, y, 0, 3, w, label, False)
     if not win:
         return
@@ -489,6 +496,12 @@ def run(stdscr, yt, player):
             player.next()
         elif c == ord("p"):
             player.prev()
+        elif c == ord("r"):  # repeat-all; ↻ in the progress bar shows the state
+            player.toggle_loop()
+        elif c == ord("e"):  # left-ear-only; ◐ in the progress bar shows it
+            player.toggle_left_ear()
+        elif c in (ord("["), ord("]")):  # msm's own volume, not the system's
+            player.volume(-5 if c == ord("[") else 5)
         elif c == ord("h"):
             focus = max(0, focus - 1)
         elif c == ord("l"):

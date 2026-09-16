@@ -409,9 +409,14 @@ def cmusfm_reset():
     silently drops now-playing + scrobbles while in that state — after a
     sleep/wake it can sit there for the rest of the session with no error
     anywhere. Cheaper to start each msm session with a new daemon."""
+    # SIGKILL, not SIGTERM: a TERM'd server unblocks its poll() but then hangs
+    # in the curl teardown with the listening socket still open, so
+    # cmusfm_server_check() keeps connecting to a corpse and every status
+    # message is silently dropped. The leftover socket file is harmless — a
+    # fresh server unlinks it before bind.
     # ponytail: blunt pkill. If you ever run cmus alongside msm, its in-flight
     # track loses its scrobble — narrow to a socket health-check if that bites.
-    subprocess.run(["pkill", "-x", "cmusfm"], check=False)
+    subprocess.run(["pkill", "-9", "-x", "cmusfm"], check=False)
 
 
 def cmusfm(status, track=None):
@@ -425,7 +430,13 @@ def cmusfm(status, track=None):
             "title", track["title"],
             "duration", str(track["duration"]),
         ]
-    subprocess.run(args, check=False)
+    # start_new_session: the daemon is forked by *this* client, so without a
+    # new session it lands in msm's process group and Ctrl+Z on msm freezes it
+    # too. A stopped daemon is the worst failure mode there is: connect() to
+    # its listening socket still succeeds, so cmusfm_server_check() calls it
+    # healthy and every later status message is written into a socket nobody
+    # reads — no error, exit 0, nothing scrobbled.
+    subprocess.run(args, check=False, start_new_session=True)
 
 
 def cache_path(track):
@@ -566,6 +577,61 @@ class Player:
     def toggle_pause(self):
         self.ipc.cmd(["cycle", "pause"])
 
+    def toggle_loop(self):
+        """Repeat-all: after the last track mpv restarts at track 1.
+
+        The setting is a global mpv option, so it survives the `loadfile
+        replace` in play() -- a new album inherits it -- and it makes
+        playlist-next/prev wrap around the ends of the playlist.
+        """
+        # ponytail: mpv's own cycle-values, not a read-modify-write. Plain
+        # `cycle` would walk loop-playlist's other choices (force/N too);
+        # cycle-values pins the two we want.
+        self.ipc.cmd(["cycle-values", "loop-playlist", "inf", "no"])
+
+    def looping(self):
+        """True while repeat-all is on. mpv answers False for off and the
+        string 'inf' for on (never 'no'), so truthiness is enough. An IPC
+        failure also reads False -- the indicator under-reports, never lies
+        the other way."""
+        return bool(self.ipc.cmd(["get_property", "loop-playlist"]))
+
+    # Both channels folded into the left one, right muted. Halved so the
+    # fold-down cannot clip. Two syntax traps, both verified live against mpv
+    # v0.41.0 + libavfilter 11: a bare pan=... trips mpv's own arg parser on
+    # the | separators (hence lavfi=[...]), and the mute has to be 0*c0, not
+    # 0 -- ffmpeg wants a channel name in every term. Neither shows up until
+    # the filter graph is built, which happens at playback, not at toggle.
+    LEFT_EAR_AF = "lavfi=[pan=stereo|c0=0.5*c0+0.5*c1|c1=0*c0]"
+
+    def toggle_left_ear(self):
+        """Left-ear-only mode: music sits in the left bud, right stays free
+        for everything else on the machine.
+
+        ponytail: mpv's own `af toggle` -- it adds the filter if absent and
+        drops it if present, so no mirrored flag here to drift out of sync.
+        """
+        self.ipc.cmd(["af", "toggle", self.LEFT_EAR_AF])
+
+    def volume(self, delta):
+        """Nudge mpv's own software volume -- this player only, the system
+        mixer and every other app are untouched. It is a global mpv option,
+        so it survives the `loadfile replace` in play(). mpv clamps to
+        --volume-max (130 by default) on its own."""
+        self.ipc.cmd(["add", "volume", delta])
+
+    def volume_pct(self):
+        """Current volume as a whole percent. An IPC failure reads 100 -- the
+        indicator then just matches mpv's own default."""
+        v = self.ipc.cmd(["get_property", "volume"])
+        return 100 if v is None else int(v)
+
+    def left_ear(self):
+        """True while left-ear-only is on. pan is the only filter we ever
+        add, so a non-empty chain means it is on; an IPC failure reads False
+        -- the indicator under-reports, never lies the other way."""
+        return bool(self.ipc.cmd(["get_property", "af"]))
+
     def next(self):
         self.ipc.cmd(["playlist-next"])
 
@@ -596,23 +662,35 @@ class Player:
         except RuntimeError:
             return
         last_path = last_pause = None
+        last_pos = 0
         recorded = False  # YT history logged for the current track yet?
         while self.proc.poll() is None:
             path = ipc.cmd(["get_property", "path"])
             pause = ipc.cmd(["get_property", "pause"])
-            if path and path != last_path:
+            raw = ipc.cmd(["get_property", "time-pos"])
+            pos = raw or 0
+            # Repeat-all over a one-track playlist replays the same file, so
+            # `path` never changes and cmusfm would never hear about the play
+            # that just finished. A rewind is the only signal left. Nothing
+            # seeks backwards in msm, so this cannot be a user scrub.
+            replayed = raw is not None and path == last_path and pos + 2 < last_pos
+            if path and (path != last_path or replayed):
                 self.current = self.by_url.get(path)
                 if self.current:
                     cmusfm("playing", self.current)
                 last_path, last_pause, recorded = path, False, False
+            elif last_path and not path:
+                # Playlist ran out: mpv idles instead of exiting, so without an
+                # explicit stop cmusfm sits on the last track and never submits it.
+                cmusfm("stopped", self.current)
+                last_path, self.current = None, None
             elif self.current and pause is not None and pause != last_pause:
                 cmusfm("paused" if pause else "playing", self.current)
                 last_pause = pause
-            if self.current and not recorded:
-                pos = ipc.cmd(["get_property", "time-pos"]) or 0
-                if pos >= 30:
-                    self._record_yt(self.current)
-                    recorded = True
+            last_pos = pos
+            if self.current and not recorded and pos >= 30:
+                self._record_yt(self.current)
+                recorded = True
             time.sleep(1)
         cmusfm("stopped", self.current)
 

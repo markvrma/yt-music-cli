@@ -447,9 +447,9 @@ def cache_path(track):
     album art loaded but playback and duration never did. yt-dlp fetches in
     bounded chunks, so it downloads and mpv plays the file.
     """
-    # ponytail: itag 140 only (m4a, 130k) so the path is known before the
-    # download finishes and mpv can be queued up front. If YouTube stops
-    # serving 140, widen the format and glob for the extension instead.
+    # ponytail: --extract-audio --audio-format m4a in fetch() forces the
+    # extension regardless of source itag, so path is known before the
+    # download finishes and mpv can be queued up front.
     vid = _video_id(track["url"])
     return os.path.join(STREAM_CACHE, vid + ".m4a") if vid else track["url"]
 
@@ -465,7 +465,11 @@ def fetch(track):
     # The web client is the only one still handing out a full-length URL, and
     # it needs both a signed-in cookie jar and a PO token provider — without
     # them googlevideo serves the first ~1MB and then 403s.
-    subprocess.run(["yt-dlp", "-q", "--no-warnings", "-f", "140",
+    # itag 140 now needs a PO token msm doesn't provide, so it 404s most of
+    # the time — fall back to 18 (muxed mp4, no PO token needed) and strip
+    # the video track back down to m4a so cache_path's extension still holds.
+    subprocess.run(["yt-dlp", "-q", "--no-warnings", "-f", "140/18/bestaudio",
+                    "--extract-audio", "--audio-format", "m4a",
                     "--cookies-from-browser", COOKIE_BROWSER,
                     "--extractor-args", "youtube:player_client=web",
                     "-o", path, track["url"]], check=False,

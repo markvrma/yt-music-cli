@@ -207,8 +207,11 @@ def draw_art(win, path):
         return
     try:
         grid = _art_grid(path, cols, rows)
-    except Exception:
-        _put(win, h // 2, (w - 6) // 2, "no art", 6, curses.color_pair(DIM))
+    except Exception as e:
+        # ImportError = no Pillow, or a Pillow built for the other arch. Saying
+        # "no art" for that hid a wrong-architecture wheel for a long while.
+        msg = "no PIL" if isinstance(e, ImportError) else "no art"
+        _put(win, h // 2, (w - len(msg)) // 2, msg, len(msg), curses.color_pair(DIM))
         return
     if _art_owner[0] != (path, cols, rows):
         # Only one cover is on screen at a time, so recycle the pair slots.
@@ -552,6 +555,39 @@ def run(stdscr, yt, player):
                 flash, flash_ttl = "♥ like failed — run `msm auth` (session expired?)", 8
 
 
+def _terminfo_without_rep():
+    """Point ncurses at a copy of $TERM's entry with `rep` deleted.
+
+    Apple's ncurses (5.7) compresses a run of identical cells with the REP
+    escape but writes out only the low byte of a multibyte character: a row of
+    ▀ leaves as a bare 0x80, which is invalid UTF-8, and the terminal draws a
+    row of replacement glyphs instead. That is the whole album art and the
+    whole progress bar. Nothing switches REP off at runtime, so hand ncurses an
+    entry that never offers it.
+    """
+    import re
+    import shutil
+    import subprocess
+    term = os.environ.get("TERM", "")
+    if not term or not shutil.which("tic") or not shutil.which("infocmp"):
+        return
+    out = os.path.expanduser("~/.cache/msm/terminfo")
+    try:
+        src = subprocess.run(["infocmp", "-x", term], check=True,
+                             capture_output=True, text=True).stdout
+        if "rep=" not in src:
+            return
+        os.makedirs(out, exist_ok=True)
+        # ponytail: recompiled every launch (~15ms) so a terminal upgrade can
+        # never leave a stale entry here; cache it if startup ever needs the ms.
+        subprocess.run(["tic", "-x", "-o", out, "-"], check=True,
+                       input=re.sub(r"\s*\brep=[^,]*,", "", src),
+                       capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return  # stay on the system entry: speckled art beats no player
+    os.environ["TERMINFO"] = out
+
+
 def main():
     import shutil
     import sys
@@ -563,6 +599,7 @@ def main():
             sys.exit("missing required tool: " + tool)
     yt = ymc.get_yt()
     player = ymc.Player(yt)
+    _terminfo_without_rep()   # must precede initscr
     try:
         curses.wrapper(run, yt, player)
     finally:

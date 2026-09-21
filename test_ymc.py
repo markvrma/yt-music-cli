@@ -430,3 +430,23 @@ if __name__ == "__main__":
             fn()
             print("ok", name)
     print("all passed")
+
+
+def test_terminfo_msm_hands_ncurses_has_no_rep():
+    """ncurses 5.7 writes only the low byte of a multibyte char when REP
+    compresses a run of identical cells, so a row of ▀ reaches the terminal as
+    invalid UTF-8 — the art and the progress bar come out as replacement
+    glyphs. The entry msm points ncurses at must not advertise `rep`."""
+    import shutil
+    if not (shutil.which("tic") and shutil.which("infocmp")):
+        return
+    with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}):
+        os.environ.pop("TERMINFO", None)
+        assert "rep=" in subprocess.run(["infocmp", "-1", "xterm-256color"],
+                                        capture_output=True, text=True).stdout, \
+            "system entry has no rep -> test proves nothing"
+        tui._terminfo_without_rep()
+        assert os.environ.get("TERMINFO"), "TERMINFO not redirected"
+        out = subprocess.run(["infocmp", "-1", "xterm-256color"],
+                             capture_output=True, text=True).stdout
+    assert "rep=" not in out, out

@@ -139,9 +139,20 @@ fn main() {
     player.quit();
 }
 
-/// shutil.which equivalent.
+/// crate::*_path() read $HOME; tests that repoint it or read the real files
+/// serialize on this.
+#[cfg(test)]
+pub static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// shutil.which equivalent: a regular file with an exec bit somewhere on PATH.
 pub fn on_path(tool: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
+        .map(|p| {
+            std::env::split_paths(&p).any(|d| {
+                std::fs::metadata(d.join(tool))
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+        })
         .unwrap_or(false)
 }

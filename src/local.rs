@@ -1,6 +1,5 @@
 //! Local ~/Music library, play history, album-art download cache.
 //! Port of ymc.py art_file/scan_local/_probe/load_local_album/local_art/history.
-#![allow(dead_code)]
 
 use crate::{art_cache, hist_path, local_music, Album, LocalDir, Track, AUDIO_EXT};
 use serde::Serialize;
@@ -259,7 +258,8 @@ pub fn load_history() -> Vec<Album> {
 }
 
 /// Python wrote thumb=None for art-less local albums and tolerates partial
-/// track dicts; normalize so one such entry doesn't blank the whole history.
+/// track dicts; normalize, and drop only an entry that still won't parse, so
+/// one bad entry can't blank the whole history (record() would then overwrite it).
 fn parse_history(bytes: &[u8]) -> Option<Vec<Album>> {
     let mut v: Value = serde_json::from_slice(bytes).ok()?;
     for a in v.as_array_mut()? {
@@ -279,7 +279,12 @@ fn parse_history(bytes: &[u8]) -> Option<Vec<Album>> {
             t.entry("duration").or_insert(0.into());
         }
     }
-    serde_json::from_value(v).ok()
+    Some(
+        v.as_array()?
+            .iter()
+            .filter_map(|a| serde_json::from_value(a.clone()).ok())
+            .collect(),
+    )
 }
 
 /// Prepend album, drop older same-title, keep last 5, write, return it.
@@ -353,10 +358,7 @@ fn to_python_json<T: Serialize>(v: &T) -> serde_json::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // crate::hist_path()/art_cache() read $HOME; serialize tests that repoint it
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    use crate::HOME_LOCK;
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("msm-local-{tag}-{}", std::process::id()));
@@ -435,6 +437,7 @@ mod tests {
     #[test]
     fn test_real_history_reads() {
         // read-only: the real file must parse (never written by tests)
+        let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/ymc/history.json");
         if let Ok(b) = std::fs::read(&p) {
             assert!(parse_history(&b).is_some(), "real history.json failed to parse");

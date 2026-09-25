@@ -1,7 +1,6 @@
 //! One background mpv for the session, driven over its JSON IPC socket;
 //! yt-dlp fetch cache; cmusfm scrobble bridge. Port of ymc.py's cmusfm /
 //! cache_path / fetch / IPC / Player.
-#![allow(dead_code)]
 
 use crate::ytm::{self, Yt};
 use crate::Track;
@@ -90,13 +89,19 @@ fn cmusfm(status: &str, track: Option<&Track>) {
     // is: connect() to its listening socket still succeeds, so
     // cmusfm_server_check() calls it healthy and every later status message
     // is written into a socket nobody reads — no error, exit 0, nothing
-    // scrobbled. process_group(0) instead of setsid via pre_exec: std, no
-    // unsafe, and leaving the terminal's foreground group is all that's
-    // needed to dodge SIGTSTP.
-    let _ = Command::new(&argv[0])
-        .args(&argv[1..])
-        .process_group(0)
-        .status();
+    // scrobbled. setsid, not just a new process group: the daemon must also
+    // drop msm's controlling tty, or with `stty tostop` its first tty write
+    // stops it via SIGTTOU — the same silent-drop failure.
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    // SAFETY: setsid is async-signal-safe, the only call between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let _ = cmd.status();
 }
 
 // ---- yt-dlp cache ------------------------------------------------------------
@@ -172,6 +177,7 @@ impl Ipc {
             }
             if let Ok(sock) = UnixStream::connect(path) {
                 let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
                 return Ok(Ipc { sock, buf: Vec::new(), rid: 0 });
             }
             thread::sleep(Duration::from_millis(100));

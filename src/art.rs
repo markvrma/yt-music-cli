@@ -1,7 +1,6 @@
 //! Album art as 256-color half-blocks. Port of tui.py's art section; image
 //! decode via ffmpeg (native JPEG planes or rgb24) instead of Pillow, then BOX resize,
 //! Color enhance, point and FASTOCTREE quantize re-done Pillow-exact.
-#![allow(dead_code)] // callers land with the tui port
 
 use std::collections::HashMap;
 use std::ffi::c_void;

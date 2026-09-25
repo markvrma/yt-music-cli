@@ -4,7 +4,6 @@
 //! Browser auth (not OAuth): YouTube's youtubei API rejects generic Google
 //! Cloud OAuth tokens with HTTP 400, so history/recs need real website
 //! session headers, which is what ytmusicapi's browser auth provides.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -511,10 +510,6 @@ fn run_setup(source: Option<&str>, dir: &Path, path: &Path) -> Result<String, St
 ///
 /// The youtubei API silently downgrades unauthenticated requests, so the
 /// LOGGED_IN flag on the home page is the reliable signal.
-pub fn is_logged_in() -> bool {
-    is_logged_in_at(&crate::auth_path())
-}
-
 fn is_logged_in_at(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
@@ -655,6 +650,7 @@ mod tests {
     #[test]
     fn test_load_real_browser_json_readonly() {
         // read-only check against the real ~/.config/ymc/browser.json if present
+        let _g = crate::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::auth_path();
         if !p.is_file() {
             return;
@@ -671,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // verifies via a live GET to music.youtube.com
     fn test_run_setup_flow_temp_dir() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("msm-setup-test-{}", std::process::id()));
@@ -703,7 +700,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_is_logged_in_and_visitor_id() {
-        println!("is_logged_in = {}", is_logged_in());
+        println!("is_logged_in = {}", is_logged_in_at(&crate::auth_path()));
         let vid = fetch_visitor_id();
         println!("visitor id len = {:?}", vid.as_ref().map(|v| v.len()));
         assert!(vid.is_some_and(|v| !v.is_empty()));

@@ -2,7 +2,6 @@
 //! search, album, playlist, home recs, song playback tracking, rate.
 //! Port of the YouTube Music section of ymc.py (+ ytmusicapi 1.10.3's
 //! request building and only the parse paths that yield the fields msm reads).
-#![allow(dead_code)]
 
 use crate::auth::Auth;
 use crate::{Album, Item, Track};
@@ -106,11 +105,6 @@ impl Yt {
             }
         }
         out
-    }
-
-    /// -> (title, tracks, thumb). Unavailable tracks (no videoId) dropped.
-    pub fn album_tracks(&self, browse_id: &str) -> Result<(String, Vec<Track>, String), String> {
-        Ok(album_from_page(&self.get_album(browse_id)?))
     }
 
     /// Search result OR home item -> (title, tracks, thumb); infers type when

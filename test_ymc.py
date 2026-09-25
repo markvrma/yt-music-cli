@@ -424,6 +424,97 @@ def test_watch_rescrobbles_a_replayed_track_and_stops_at_playlist_end():
     ], calls
 
 
+class _RecWin(_Win):
+    """_Win that also records every string written, so a test can read a frame."""
+
+    def __init__(self, h, w, sink):
+        super().__init__(h, w)
+        self.sink = sink
+
+    def box(self):
+        pass
+
+    def attrset(self, attr):
+        pass
+
+    def addnstr(self, y, x, s, n, attr=0):
+        super().addnstr(y, x, s, n, attr)
+        self.sink.append(s[:n])
+
+
+class _Scr:
+    """Stub stdscr: feeds `keys` to getch, one recorded frame per repaint."""
+
+    def __init__(self, keys):
+        self.keys, self.frames, self.cur = list(keys), [], []
+
+    def getmaxyx(self):
+        return 40, 120
+
+    def timeout(self, ms):
+        pass
+
+    def redrawwin(self):
+        pass
+
+    def erase(self):
+        self.cur = []
+        self.frames.append(self.cur)
+
+    def refresh(self):
+        pass
+
+    def derwin(self, h, w, y, x):
+        return _RecWin(h, w, self.cur)
+
+    def getch(self):
+        return self.keys.pop(0) if self.keys else ord("q")
+
+
+def test_local_pane_opens_an_album_tracklist_and_esc_puts_the_list_back():
+    """enter on a LOCAL album swaps the pane to its tracks; j/k move inside it,
+    enter plays the highlighted track alone, f the album from there, Esc
+    restores the album list."""
+    tracks = [{"url": "u%d" % i, "title": "T%d" % i} for i in range(3)]
+    album = {"title": "Album X", "tracks": tracks, "local": True, "thumb": ""}
+    played = []
+
+    class StubPlayer:
+        current = None
+
+        def progress(self):
+            return 0, 0, False, ""
+
+        def volume_pct(self):
+            return 100
+
+        def looping(self):
+            return False
+
+        def left_ear(self):
+            return False
+
+        def play(self, tracks, start):
+            played.append((len(tracks), start))
+
+    ENTER = 10
+    scr = _Scr([ord("l"), ENTER, ord("j"), 27, ENTER, ord("j"), ENTER,
+                ord("l"), ENTER, ord("j"), ord("f")])
+    with mock.patch.object(ymc, "AUTHED", False), \
+            mock.patch.object(ymc, "load_history", lambda: []), \
+            mock.patch.object(ymc, "scan_local", lambda: [album]), \
+            mock.patch.object(ymc, "record", lambda *a: []), \
+            mock.patch.object(curses, "curs_set", lambda v: None), \
+            mock.patch.object(curses, "color_pair", lambda p: 0):
+        tui.run(scr, None, StubPlayer())
+    frames = ["".join(f) for f in scr.frames]
+    assert "Album X" in frames[2] and "T2" in frames[2], frames[2]
+    assert "LOCAL ~/Music" not in frames[2], "album list still there"
+    assert "LOCAL ~/Music" in frames[4], frames[4]   # Esc -> album list back
+    # enter = the highlighted track alone; f = the whole album from there
+    assert played == [(1, 0), (3, 1)], played
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

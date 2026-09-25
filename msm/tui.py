@@ -7,6 +7,9 @@ Screens:
           album art (square, capped); bottom = progress bar.
   search  '/' opens it: type query, enter runs it, jk pick a result,
           enter = load into browse (no play), f = load + play, Esc = back.
+LOCAL pane: enter opens the selected album's tracklist in place (j/k move,
+      enter plays that one track, f plays the album from there, a/A queue); Esc — or anything that leaves the
+      pane, h/l or '/' — puts the album list back.
 Keys: h/l switch pane, j/k move, space pause, n/p next/prev, a queue,
       A play-next, r repeat-all, e left-ear, [ ] volume, L like, q quit. Queue (a) = play after the
       whole queue; play-next (A) = play right after the current track, queue
@@ -281,6 +284,8 @@ def run(stdscr, yt, player):
     query = ""
     results = []
     now = {"album": None, "art": None}
+    drill = None         # album opened inside the LOCAL pane (tracklist view)
+    dsel = 0             # selection inside that tracklist
 
     if ymc.AUTHED:  # network call -> off-thread so it can't delay first paint
         threading.Thread(target=lambda: recs.extend(ymc.get_recs(yt)),
@@ -417,9 +422,15 @@ def run(stdscr, yt, player):
                 draw_rows(wl, [t["title"] for t in al["tracks"]] if al and al.get("tracks") else [],
                           sel[0], focus == 0)
 
-            wm = box(stdscr, 0, npw, main_h, lmw, "LOCAL ~/Music  (enter=open f=play)", focus == 1)
-            if wm:
-                draw_rows(wm, [a["title"] for a in local], sel[1], focus == 1)
+            if drill is not None:
+                wm = box(stdscr, 0, npw, main_h, lmw,
+                         "%s  (esc=back enter=play a=queue)" % drill["title"], focus == 1)
+                if wm:
+                    draw_rows(wm, [t["title"] for t in drill["tracks"]], dsel, focus == 1)
+            else:
+                wm = box(stdscr, 0, npw, main_h, lmw, "LOCAL ~/Music  (enter=open f=play)", focus == 1)
+                if wm:
+                    draw_rows(wm, [a["title"] for a in local], sel[1], focus == 1)
 
             if rcw:
                 p2 = pane2()
@@ -491,6 +502,34 @@ def run(stdscr, yt, player):
         # ----- browse screen -----
         if c == ord("q"):
             return
+
+        # LOCAL pane showing an album's tracklist: its own keys, and any key
+        # that leaves the pane (h/l, /, Esc) closes it back to the album list.
+        if drill is not None and focus == 1:
+            if c in (ord("j"), curses.KEY_DOWN):
+                dsel = clamp(dsel + 1, 0, len(drill["tracks"]) - 1)
+                continue
+            if c in (ord("k"), curses.KEY_UP):
+                dsel = clamp(dsel - 1, 0, len(drill["tracks"]) - 1)
+                continue
+            if c in (curses.KEY_ENTER, 10, 13, ord("f")):
+                if c == ord("f"):                 # f = the album, from here on
+                    do_play(drill, dsel)
+                else:                             # enter = this track alone
+                    t = drill["tracks"][dsel]
+                    do_play({"title": t["title"], "tracks": [t],
+                             "thumb": t.get("thumb") or drill.get("thumb") or ""}, 0)
+                drill, focus, sel[0] = None, 0, 0
+                continue
+            if c in (ord("a"), ord("A")):
+                t = drill["tracks"][dsel]
+                add_tracks([t], t["title"], t.get("thumb") or drill.get("thumb") or "",
+                           "next" if c == ord("A") else "queue")
+                continue
+            drill = None
+            if c == 27:  # Esc: back to the album list, nothing else
+                continue
+            # h/l, /, space, n/p ... fall through to the normal browse keys
         if c == ord("/"):
             screen, focus, query, results = "search", 0, "", []
         elif c == ord(" "):
@@ -518,6 +557,10 @@ def run(stdscr, yt, player):
         elif c in (curses.KEY_ENTER, 10, 13):
             if focus == 0 and now["album"] and now["album"].get("tracks"):
                 do_play(now["album"], sel[0])
+            elif focus == 1:
+                a = cur_album()
+                if a and ensure_tracks(a):
+                    drill, dsel = a, 0
             else:
                 a = cur_album()  # rec items resolve here; hist items no-op
                 if a and ensure_tracks(a):

@@ -10,7 +10,7 @@ IPC socket, so the TUI owns the terminal.
   <img src="docs/screenshot-search.png" width="48%" alt="search screen: results tagged song/album/playlist, ranked by relevance">
 </p>
 
-## System requirements (not pip-installable — install separately)
+## System requirements (install separately)
 
 - `mpv`, `yt-dlp`, `cmusfm`, `ffmpeg`/`ffprobe` on PATH (ffprobe reads local tags; ffmpeg extracts embedded art)
 - cmusfm configured for last.fm (its daemon must be running — it is whenever
@@ -21,10 +21,8 @@ On macOS: `brew install mpv yt-dlp ffmpeg cmus cmusfm`
 ## Install
 
 ```sh
-pip install msm-player            # from PyPI (once published)
-pip install git+https://github.com/markverma/msm-player   # straight from git
-pip install .                     # from a local clone
-pipx install .                    # isolated + on PATH globally (recommended for CLI use)
+cargo install --path .            # from a local clone -> ~/.cargo/bin/msm
+cargo install --git https://github.com/markverma/msm-player   # straight from git
 ```
 
 Then run the TUI from anywhere:
@@ -33,7 +31,9 @@ Then run the TUI from anywhere:
 msm
 ```
 
-(`python -m msm` also works.)
+Coming from the Python version? `pipx uninstall msm-player` (or `pip uninstall
+msm-player`) so only one `msm` is on PATH. Config, history, auth and the
+download cache are shared unchanged.
 
 ## Sign in to YouTube Music (optional)
 
@@ -65,17 +65,10 @@ working later, the session expired — just run `msm auth` again.
 ## Develop
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install -e .        # editable install; `msm` entry point in .venv/bin
-.venv/bin/python test_ymc.py      # self-checks
-```
-
-## Build a distributable
-
-```sh
-pip install build twine
-python -m build                   # -> dist/*.whl and dist/*.tar.gz
-twine upload dist/*               # publish to PyPI
+cargo run                         # build + run the TUI
+cargo test                        # self-checks (no network, no mpv, no terminal)
+cargo test -- --ignored           # + live checks: network, real mpv/yt-dlp (plays audio)
+cargo build --release             # -> target/release/msm
 ```
 
 Two screens:
@@ -105,9 +98,3 @@ Like `space`/`n`/`p` it works on the browse screen, not inside search results.
 
 Local albums use `ffprobe` for tags (title/artist/album/duration) and play straight from disk.
 Play history persists to `~/.config/ymc/history.json` (last 5 albums).
-
-## Plain search CLI (fallback)
-
-```sh
-python -m msm.ymc
-```

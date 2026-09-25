@@ -22,7 +22,7 @@ const USER_AGENT: &str =
 // ytmusicapi uses 30s; 15s so a hung request can't freeze the UI for long
 const TIMEOUT: Duration = Duration::from_secs(15);
 const BODY_LIMIT: u64 = 64 * 1024 * 1024; // home/playlist pages run to a few MB
-const MAX_PAGES: usize = 200; // playlist continuation safety cap (~20k tracks)
+const PLAYLIST_LIMIT: usize = 100; // ytmusicapi get_playlist default limit
 const CPNA: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
 // content-type words get_home() prepends into the artists list as a stray token
 const TYPEWORDS: &[&str] = &[
@@ -158,7 +158,9 @@ impl Yt {
         parse_album(&self.send_request("browse", json!({ "browseId": browse_id }), "")?)
     }
 
-    /// All tracks (ytmusicapi defaults to limit=100; msm wants the whole list).
+    /// Same page count as ytmusicapi's get_playlist(limit=100): continuation
+    /// pages are fetched while fewer than 100 *continuation* tracks are in
+    /// (the first page doesn't count), nothing is truncated.
     fn get_playlist(&self, playlist_id: &str) -> Result<PlaylistPage, String> {
         let browse_id = if playlist_id.starts_with("VL") {
             playlist_id.to_string()
@@ -168,10 +170,9 @@ impl Yt {
         let resp = self.send_request("browse", json!({ "browseId": browse_id }), "")?;
         let audio = playlist_id.starts_with("OLA") || playlist_id.starts_with("VLOLA");
         let (mut page, mut token) = parse_playlist(&resp, audio)?;
-        let mut pages = 0;
+        let mut more = 0;
         while let Some(t) = token.take() {
-            pages += 1;
-            if pages > MAX_PAGES {
+            if more >= PLAYLIST_LIMIT {
                 break;
             }
             let resp = self.send_request("browse", json!({ "continuation": t }), "")?;
@@ -181,6 +182,7 @@ impl Yt {
             if items.is_empty() {
                 break;
             }
+            more += items.len();
             page.tracks.extend(items);
             token = next;
         }
@@ -1673,7 +1675,7 @@ mod tests {
         let recs = yt.get_recs(5);
         assert!(!recs.is_empty());
         let _ = yt.resolve_result(recs[0].rec.as_ref().unwrap()).unwrap();
-        // >100 tracks: follows continuations past ytmusicapi's default limit
+        // >100 tracks: first page + continuations, same count ytmusicapi returns
         let big = yt
             .get_playlist("PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI")
             .unwrap();

@@ -244,6 +244,7 @@ name = "msm"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "libc",
  "serde",
  "serde_json",
  "sha1_smol",

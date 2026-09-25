@@ -546,6 +546,10 @@ enum Key {
     Char(char),
     /// Ctrl-C: curses runs cbreak, so it was SIGINT -> KeyboardInterrupt out of run.
     Interrupt,
+    /// Ctrl-Z: under cbreak the tty sent SIGTSTP to the whole process group
+    /// (mpv included, so the music stops) and `fg` resumed with a redraw.
+    /// Raw mode turns that off, so run() does it by hand — see `suspend`.
+    Suspend,
 }
 
 /// Map a crossterm key to what curses' getch would have returned (possibly
@@ -563,6 +567,7 @@ fn map_key(k: KeyEvent) -> Vec<Key> {
         KeyCode::Up => vec![Key::Up],
         KeyCode::Down => vec![Key::Down],
         KeyCode::Char('c') if ctrl => vec![Key::Interrupt],
+        KeyCode::Char('z') if ctrl => vec![Key::Suspend],
         KeyCode::Char('h') if ctrl => vec![Key::Backspace], // ^H = 8
         KeyCode::Char('j' | 'm') if ctrl => vec![Key::Enter], // ^J = 10, ^M = 13
         KeyCode::Char(_) if ctrl => vec![],
@@ -1230,6 +1235,26 @@ fn restore_terminal() {
     }
 }
 
+/// Take over the terminal: raw mode, alt screen, hidden cursor.
+fn enter_terminal(out: &mut impl Write) -> io::Result<()> {
+    terminal::enable_raw_mode()?;
+    TERM_ACTIVE.store(true, Ordering::SeqCst);
+    queue!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+    out.flush()
+}
+
+/// Ctrl-Z the way curses did it: hand the terminal back, stop our whole
+/// process group (mpv too — player.rs moves only cmusfm out of the group),
+/// and take the terminal again once `fg` sends SIGCONT. The caller redraws.
+fn suspend(out: &mut impl Write) {
+    restore_terminal();
+    // SAFETY: kill(2) with pid 0 = our process group; no memory involved.
+    unsafe {
+        libc::kill(0, libc::SIGTSTP);
+    }
+    let _ = enter_terminal(out);
+}
+
 /// Restores the terminal when run() returns. On a panic the hook (installed in
 /// run) restores it first so the message lands on the normal screen; the
 /// unwind then drops this guard, which also quits mpv — main's player.quit()
@@ -1264,10 +1289,8 @@ pub fn run(yt: Arc<Yt>, player: &Player) {
         eprintln!("msm: not a terminal");
         return;
     }
-    TERM_ACTIVE.store(true, Ordering::SeqCst);
     let _guard = TermGuard { player };
-    let _ = queue!(out, terminal::EnterAlternateScreen, cursor::Hide);
-    let _ = out.flush();
+    let _ = enter_terminal(&mut out);
 
     let env = Real { yt, player };
     let mut st = State::new(&env);
@@ -1285,6 +1308,10 @@ pub fn run(yt: Arc<Yt>, player: &Player) {
             continue;
         };
         for key in map_key(k) {
+            if key == Key::Suspend {
+                suspend(&mut out);
+                break; // back from fg: repaint
+            }
             if !st.handle_key(&env, key) {
                 return;
             }
@@ -1425,6 +1452,16 @@ mod tests {
         assert!(frames[4].contains("LOCAL ~/Music"), "{}", frames[4]); // Esc -> album list back
                                                                        // enter = the highlighted track alone; f = the whole album from there
         assert_eq!(*env.played.borrow(), vec![(1, 0), (3, 1)]);
+    }
+
+    #[test]
+    fn ctrl_keys_map_like_curses() {
+        let k = |c, m| map_key(KeyEvent::new(KeyCode::Char(c), m));
+        assert_eq!(k('z', KeyModifiers::CONTROL), [Key::Suspend]);
+        assert_eq!(k('c', KeyModifiers::CONTROL), [Key::Interrupt]);
+        assert_eq!(k('h', KeyModifiers::CONTROL), [Key::Backspace]);
+        assert_eq!(k('A', KeyModifiers::SHIFT), [Key::Char('A')]);
+        assert_eq!(k('x', KeyModifiers::ALT), [Key::Esc, Key::Char('x')]);
     }
 
     #[test]

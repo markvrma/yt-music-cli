@@ -91,11 +91,15 @@ fn py_round(v: f64) -> i64 {
 
 // ---- cell buffer ------------------------------------------------------------
 
+/// One screen cell: the base char plus any zero-width marks attached to it
+/// (U+FE0F, combining accents). "" = right half of the wide char to its left.
+type Cell = (String, Style);
+
 /// The whole screen; `erase` = a fresh Buf.
 struct Buf {
     h: i64,
     w: i64,
-    cells: Vec<(char, Style)>,
+    cells: Vec<Cell>,
 }
 
 /// A derwin: a rectangle of the screen, coordinates relative to it.
@@ -107,20 +111,51 @@ struct Win {
     w: i64,
 }
 
+extern "C" {
+    // the libc crate doesn't bind it; it's in libSystem / glibc.
+    fn wcwidth(c: libc::wchar_t) -> libc::c_int;
+}
+
+/// Cells `c` takes, as ncurses measures it: wcwidth under LC_CTYPE (set in
+/// run(), like Python does at startup). Controls come back -1.
+fn char_width(c: char) -> i32 {
+    // SAFETY: pure libc lookup on a code point.
+    unsafe { wcwidth(c as libc::wchar_t) }
+}
+
 impl Buf {
     fn new(h: i64, w: i64) -> Buf {
         let n = (h.max(0) * w.max(0)) as usize;
         Buf {
             h: h.max(0),
             w: w.max(0),
-            cells: vec![(' ', PLAIN); n],
+            cells: vec![(" ".into(), PLAIN); n],
         }
     }
 
-    fn set(&mut self, y: i64, x: i64, ch: char, st: Style) {
-        if (0..self.h).contains(&y) && (0..self.w).contains(&x) {
-            self.cells[(y * self.w + x) as usize] = (ch, st);
+    fn idx(&self, y: i64, x: i64) -> Option<usize> {
+        ((0..self.h).contains(&y) && (0..self.w).contains(&x)).then(|| (y * self.w + x) as usize)
+    }
+
+    /// Overwrite one cell. Like ncurses, clobbering either half of a wide char
+    /// blanks its other half.
+    fn set_cell(&mut self, y: i64, x: i64, s: String, st: Style) {
+        let Some(i) = self.idx(y, x) else { return };
+        if self.cells[i].0.is_empty() {
+            if let Some(l) = self.idx(y, x - 1) {
+                self.cells[l].0 = " ".into();
+            }
         }
+        if let Some(r) = self.idx(y, x + 1) {
+            if self.cells[r].0.is_empty() {
+                self.cells[r].0 = " ".into();
+            }
+        }
+        self.cells[i] = (s, st);
+    }
+
+    fn set(&mut self, y: i64, x: i64, ch: char, st: Style) {
+        self.set_cell(y, x, ch.to_string(), st);
     }
 
     #[cfg(test)]
@@ -139,7 +174,7 @@ impl Buf {
         let mut s = String::new();
         for y in 0..self.h {
             let row: String = (0..self.w)
-                .map(|x| self.cells[(y * self.w + x) as usize].0)
+                .map(|x| self.cells[(y * self.w + x) as usize].0.as_str())
                 .collect();
             s.push_str(row.trim_end());
             s.push('\n');
@@ -148,20 +183,54 @@ impl Buf {
     }
 }
 
-/// addnstr semantics: at most `n` characters (chars, not display width — same
-/// as curses under Python; n < 0 = the whole string), clipped to the window.
-/// The buffer never scrolls, so the last screen cell is safe to write.
+/// addnstr semantics: at most `n` characters (chars, not cells — n < 0 = the
+/// whole string), laid out by display width like ncurses: wide chars take 2
+/// cells, zero-width ones attach to the cell before, and a char that doesn't
+/// fit before the window edge ends the write. The buffer never scrolls, so the
+/// last screen cell is safe to write.
 fn put(buf: &mut Buf, win: Win, y: i64, x: i64, s: &str, n: i64, st: Style) {
     if !(0..win.h).contains(&y) || x < 0 {
         return;
     }
     let n = if n < 0 { usize::MAX } else { n as usize };
-    for (i, ch) in s.chars().take(n).enumerate() {
-        let cx = x + i as i64;
-        if cx >= win.w {
+    let sy = win.y + y;
+    let mut cx = x;
+    for ch in s.chars().take(n) {
+        let wd = char_width(ch);
+        if wd == 0 {
+            // combining mark / variation selector: joins the previous cell
+            let mut px = win.x + cx - 1;
+            while px > win.x && buf.idx(sy, px).is_some_and(|i| buf.cells[i].0.is_empty()) {
+                px -= 1;
+            }
+            if px >= win.x {
+                if let Some(i) = buf.idx(sy, px) {
+                    buf.cells[i].0.push(ch);
+                }
+            }
+            continue;
+        }
+        if wd < 0 {
+            // ncurses shows C0 / DEL as ^X (unctrl); other unprintables are dropped
+            if (ch as u32) < 0x20 || ch == '\x7f' {
+                if cx + 2 > win.w {
+                    break;
+                }
+                let caret = char::from_u32((ch as u32) ^ 0x40).unwrap_or('?');
+                buf.set(sy, win.x + cx, '^', st);
+                buf.set(sy, win.x + cx + 1, caret, st);
+                cx += 2;
+            }
+            continue;
+        }
+        if cx + wd as i64 > win.w {
             break;
         }
-        buf.set(win.y + y, win.x + cx, ch, st);
+        buf.set(sy, win.x + cx, ch, st);
+        if wd == 2 {
+            buf.set_cell(sy, win.x + cx + 1, String::new(), st);
+        }
+        cx += wd as i64;
     }
 }
 
@@ -550,6 +619,10 @@ enum Key {
     /// (mpv included, so the music stops) and `fg` resumed with a redraw.
     /// Raw mode turns that off, so run() does it by hand — see `suspend`.
     Suspend,
+    /// Anything curses returned that no handler matches (left/right, Tab,
+    /// Home, F-keys, other ^X): does nothing, but still closes the LOCAL
+    /// drill-in like any other key there.
+    Other,
 }
 
 /// Map a crossterm key to what curses' getch would have returned (possibly
@@ -570,10 +643,10 @@ fn map_key(k: KeyEvent) -> Vec<Key> {
         KeyCode::Char('z') if ctrl => vec![Key::Suspend],
         KeyCode::Char('h') if ctrl => vec![Key::Backspace], // ^H = 8
         KeyCode::Char('j' | 'm') if ctrl => vec![Key::Enter], // ^J = 10, ^M = 13
-        KeyCode::Char(_) if ctrl => vec![],
+        KeyCode::Char(_) if ctrl => vec![Key::Other],
         KeyCode::Char(c) if alt => vec![Key::Esc, Key::Char(c)],
         KeyCode::Char(c) => vec![Key::Char(c)], // 'A', 'L' carry SHIFT; match on the char
-        _ => vec![],
+        _ => vec![Key::Other],
     }
 }
 
@@ -1188,7 +1261,11 @@ fn render(buf: &Buf, out: &mut impl Write) -> io::Result<()> {
         let mut cur = PLAIN;
         let mut run = String::new();
         for x in 0..buf.w {
-            let (ch, st) = buf.cells[(y * buf.w + x) as usize];
+            let (ch, st) = &buf.cells[(y * buf.w + x) as usize];
+            let st = *st;
+            if ch.is_empty() {
+                continue; // right half of a wide char: the terminal already advanced
+            }
             if st != cur {
                 queue!(out, Print(std::mem::take(&mut run)))?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
@@ -1206,7 +1283,7 @@ fn render(buf: &Buf, out: &mut impl Write) -> io::Result<()> {
                 }
                 cur = st;
             }
-            run.push(ch);
+            run.push_str(ch);
         }
         queue!(out, Print(run))?;
     }
@@ -1284,6 +1361,12 @@ pub fn run(yt: Arc<Yt>, player: &Player) {
         prev(info);
     }));
 
+    // Python sets LC_CTYPE from the env at startup and curses measures text
+    // with it; wcwidth needs the same or every non-ASCII char is unprintable.
+    // SAFETY: called before any other thread reads the locale.
+    unsafe {
+        libc::setlocale(libc::LC_CTYPE, c"".as_ptr());
+    }
     let mut out = io::stdout();
     if terminal::enable_raw_mode().is_err() {
         eprintln!("msm: not a terminal");
@@ -1418,6 +1501,7 @@ mod tests {
 
     #[test]
     fn test_local_pane_opens_an_album_tracklist_and_esc_puts_the_list_back() {
+        utf8_locale();
         // enter on a LOCAL album swaps the pane to its tracks; j/k move inside it,
         // enter plays the highlighted track alone, f the album from there, Esc
         // restores the album list.
@@ -1464,6 +1548,76 @@ mod tests {
         assert_eq!(k('x', KeyModifiers::ALT), [Key::Esc, Key::Char('x')]);
     }
 
+    /// Rust starts in the "C" locale, where wcwidth calls every non-ASCII char
+    /// unprintable; the locale is process-wide, so set it once for all tests.
+    fn utf8_locale() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: once, before this test measures; any UTF-8 locale gives the same widths.
+        ONCE.call_once(|| unsafe {
+            libc::setlocale(libc::LC_CTYPE, c"en_US.UTF-8".as_ptr());
+        });
+    }
+
+    #[test]
+    fn put_lays_out_wide_and_zero_width_chars_like_ncurses() {
+        utf8_locale();
+        let mut buf = Buf::new(3, 10);
+        let win = buf.whole();
+        // U+2B50 is 2 cells, U+FE0F joins it: 8 chars -> "Album " + 2 cells
+        put(&mut buf, win, 0, 0, "Album \u{2B50}\u{FE0F}!", -1, PLAIN);
+        assert_eq!(buf.cells[6].0, "\u{2B50}\u{FE0F}");
+        assert_eq!(buf.cells[7].0, ""); // right half
+        assert_eq!(buf.cells[8].0, "!");
+        // CJK: 2 cells each; the one that would straddle the edge isn't drawn
+        put(&mut buf, win, 1, 0, "漢字漢字漢字", -1, PLAIN);
+        assert_eq!(buf.text().lines().nth(1).unwrap(), "漢字漢字漢");
+        put(&mut buf, win, 1, 1, "漢字漢字漢字", -1, PLAIN);
+        assert_eq!(buf.text().lines().nth(1).unwrap(), " 漢字漢字"); // clobbered half blanked
+                                                                     // NFD é: n counts chars, so n=2 keeps "e" + accent in one cell
+        put(&mut buf, win, 2, 0, "e\u{301}xyz", 2, PLAIN);
+        assert_eq!(buf.text().lines().nth(2).unwrap(), "e\u{301}");
+        let mut out = Vec::new();
+        render(&buf, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Album \u{2B50}\u{FE0F}!"), "{out:?}"); // continuation not printed
+    }
+
+    #[test]
+    fn draw_rows_pads_by_chars_then_clips_by_cells() {
+        utf8_locale();
+        let mut buf = Buf::new(3, 10);
+        let win = draw_box(&mut buf, 0, 0, 3, 10, "", false).unwrap();
+        draw_rows(&mut buf, win, &["漢字漢字漢字".into()], 0, false);
+        // 7 chars + 1 pad = bw, but 13 cells: like curses it runs over the right
+        // border (the derwin includes it) and stops at the window edge
+        assert_eq!(buf.text().lines().nth(1).unwrap(), "│ 漢字漢字");
+    }
+
+    #[test]
+    fn other_keys_close_the_drill_in() {
+        utf8_locale();
+        use Key::*;
+        let env = Fake {
+            local: vec![album_x()],
+            ..Default::default()
+        };
+        let frames = drive(&env, &[Char('l'), Enter, Other], 40, 120);
+        assert!(!frames[2].contains("LOCAL ~/Music"), "{}", frames[2]);
+        assert!(frames[3].contains("LOCAL ~/Music"), "{}", frames[3]);
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            [Other]
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            [Other]
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            [Other]
+        );
+    }
+
     #[test]
     fn layout_matches_python() {
         // expected values computed by the Python layout code
@@ -1501,6 +1655,7 @@ mod tests {
 
     #[test]
     fn draw_rows_scroll_offset() {
+        utf8_locale();
         assert_eq!(scroll_off(0, 5, 20), 0);
         assert_eq!(scroll_off(10, 5, 20), 8); // sel mid-box
         assert_eq!(scroll_off(19, 5, 20), 15); // clamped to the end
@@ -1519,6 +1674,7 @@ mod tests {
 
     #[test]
     fn put_truncates_by_chars_and_clips() {
+        utf8_locale();
         let mut buf = Buf::new(2, 6);
         let win = buf.whole();
         put(&mut buf, win, 0, 0, "héllo world", 3, PLAIN);
@@ -1533,6 +1689,7 @@ mod tests {
 
     #[test]
     fn box_title_and_progress() {
+        utf8_locale();
         let mut buf = Buf::new(3, 20);
         draw_progress(
             &mut buf,
@@ -1556,6 +1713,7 @@ mod tests {
 
     #[test]
     fn dump_frame() {
+        utf8_locale();
         let env = Fake {
             local: vec![album_x()],
             ..Default::default()

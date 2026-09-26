@@ -587,7 +587,7 @@ mod tests {
 
     fn player(reply: impl FnMut(&Value) -> Option<Value> + Send + 'static) -> (Player, Cmds) {
         let (ipc, cmds) = fake_mpv(reply);
-        (Player::with_ipc(Arc::new(Yt { auth: None }), ipc, None), cmds)
+        (Player::with_ipc(Arc::new(Yt::anon()), ipc, None), cmds)
     }
 
     fn by_url(p: &Player) -> HashMap<String, Track> {
@@ -814,7 +814,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pl = Player::spawn(Arc::new(Yt { auth: None }), "/tmp/ymc-check.sock", "/tmp/ymc-check.log")
+        let pl = Player::spawn(Arc::new(Yt::anon()), "/tmp/ymc-check.sock", "/tmp/ymc-check.log")
             .unwrap();
         pl.play(&[tr], 0);
         let mut ok = false;

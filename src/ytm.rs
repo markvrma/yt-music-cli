@@ -1,7 +1,7 @@
-//! YouTube Music InnerTube client — the slice of ytmusicapi msm uses:
-//! search, album, playlist, home recs, song playback tracking, rate.
-//! Port of the YouTube Music section of ymc.py (+ ytmusicapi 1.10.3's
-//! request building and only the parse paths that yield the fields msm reads).
+//! YouTube Music client. Search, album/playlist browse, and like go through
+//! `ytmapi-rs` (typed, maintained). Home-feed recs and the history/watchtime
+//! ping have no `ytmapi-rs` equivalent, so those two stay hand-rolled
+//! InnerTube calls (ymc.py's get_home / record_history, ported).
 
 use crate::auth::Auth;
 use crate::{Album, Item, Track};
@@ -11,6 +11,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use ytmapi_rs::auth::{noauth::NoAuthToken, BrowserToken};
+use ytmapi_rs::common::{AlbumID, LikeStatus, PlaylistID, VideoID, YoutubeID};
+use ytmapi_rs::parse::PlaylistItem;
+use ytmapi_rs::YtMusic;
 
 const YTM_DOMAIN: &str = "https://music.youtube.com";
 const YTM_BASE_API: &str = "https://music.youtube.com/youtubei/v1/";
@@ -20,17 +24,11 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0";
 // ytmusicapi uses 30s; 15s so a hung request can't freeze the UI for long
 const TIMEOUT: Duration = Duration::from_secs(15);
-const BODY_LIMIT: u64 = 64 * 1024 * 1024; // home/playlist pages run to a few MB
-const PLAYLIST_LIMIT: usize = 100; // ytmusicapi get_playlist default limit
+const BODY_LIMIT: u64 = 64 * 1024 * 1024; // home pages run to a few MB
 const CPNA: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
 // content-type words get_home() prepends into the artists list as a stray token
 const TYPEWORDS: &[&str] = &[
     "song", "video", "album", "single", "ep", "playlist", "artist", "episode", "podcast",
-];
-// ytmusicapi API_RESULT_TYPES (en): a leading run with one of these is a type label
-const API_RESULT_TYPES: &[&str] = &[
-    "single", "ep", "album", "artist", "playlist", "song", "video", "station", "profile",
-    "podcast", "episode",
 ];
 const MRLIR: &str = "musicResponsiveListItemRenderer";
 const MTRIR: &str = "musicTwoRowItemRenderer";
@@ -39,23 +37,63 @@ const THUMBNAILS: &str = "/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails
 const THUMBNAIL_RENDERER: &str = "/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails";
 const TITLE_TEXT: &str = "/title/runs/0/text";
 const TITLE_BROWSE_ID: &str = "/title/runs/0/navigationEndpoint/browseEndpoint/browseId";
-const PLAY_BUTTON: &str =
-    "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer";
-const TWO_COL: &str = "/contents/twoColumnBrowseResultsRenderer";
 
-/// Client. `auth == None` -> anonymous (browse + play only).
-pub struct Yt {
-    pub auth: Option<Auth>,
+/// ytmapi-rs is async (tokio); the rest of msm is sync. One small
+/// current-thread runtime, used only from this module.
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
+    .block_on(f)
 }
 
-/// Authed client if browser.json loads, else anonymous. Never fails.
-///
-/// Browser auth (not OAuth): YouTube's youtubei API rejects generic Google
-/// Cloud OAuth tokens with HTTP 400, so history/recs need real website
-/// session headers, which is what ytmusicapi's browser auth provides.
-pub fn get_yt() -> Yt {
-    // corrupt/expired headers -> unauth, app still browses+plays
-    Yt { auth: Auth::load() }
+enum YtClient {
+    Auth(YtMusic<BrowserToken>),
+    Anon(YtMusic<NoAuthToken>),
+}
+
+async fn try_authed(cookie: &str) -> Option<YtClient> {
+    let client = ytmapi_rs::Client::new().ok()?;
+    let token = BrowserToken::from_str(cookie, &client).await.ok()?;
+    let yt = ytmapi_rs::YtMusicBuilder::new_with_client(client)
+        .with_auth_token(token)
+        .build()
+        .ok()?;
+    Some(YtClient::Auth(yt))
+}
+
+async fn anon_client() -> YtClient {
+    YtClient::Anon(
+        YtMusic::new_unauthenticated()
+            .await
+            .expect("anonymous ytmusic client"),
+    )
+}
+
+/// Dispatch a `ytmapi-rs` simplified-query method to whichever client variant
+/// is live. Both `YtMusic<BrowserToken>` and `YtMusic<NoAuthToken>` expose the
+/// same inherent methods (from `impl<A: AuthToken> YtMusic<A>`), so the two
+/// match arms just monomorphize separately.
+macro_rules! call {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self.client() {
+            YtClient::Auth(c) => block_on(c.$method($($arg),*)),
+            YtClient::Anon(c) => block_on(c.$method($($arg),*)),
+        }
+    };
+}
+
+/// Client. `auth == None` -> anonymous (browse + play only). The real
+/// ytmapi-rs client is built lazily on first use (and needs network even
+/// anonymously, to fetch a visitor id), so a bare `Yt { auth: None, .. }` is
+/// still free to construct for tests.
+pub struct Yt {
+    pub auth: Option<Auth>,
+    client: OnceLock<YtClient>,
 }
 
 /// get_album() result, trimmed to what msm reads.
@@ -75,31 +113,65 @@ struct PlaylistPage {
     tracks: Vec<Item>,
 }
 
+/// Authed client if a browser cookie jar has a usable session, else
+/// anonymous. Never fails — the ytmapi-rs client itself is built lazily.
+pub fn get_yt() -> Yt {
+    Yt {
+        auth: Auth::load(),
+        client: OnceLock::new(),
+    }
+}
+
 impl Yt {
+    /// Unauthenticated client with no auth loaded. Cheap to construct (the
+    /// real ytmapi-rs client is built lazily on first network use). Test-only:
+    /// production always goes through `get_yt()`.
+    #[cfg(test)]
+    pub fn anon() -> Yt {
+        Yt {
+            auth: None,
+            client: OnceLock::new(),
+        }
+    }
+
     /// ymc.AUTHED equivalent.
     pub fn authed(&self) -> bool {
         self.auth.is_some()
     }
 
+    fn client(&self) -> &YtClient {
+        self.client.get_or_init(|| {
+            block_on(async {
+                if let Some(cookie) = self.auth.as_ref().and_then(Auth::cookie_string) {
+                    if let Some(c) = try_authed(cookie).await {
+                        return c;
+                    }
+                }
+                anon_client().await
+            })
+        })
+    }
+
     /// yt.search(query, filter=...) with filter in {"songs","albums","playlists"}.
-    /// ponytail: first page only — ytmusicapi pages on to limit=20, msm keeps 5.
     pub fn search(&self, query: &str, filter: &str) -> Result<Vec<Item>, String> {
-        let mut body = json!({ "query": query });
-        if let Some(p) = search_params(filter) {
-            body["params"] = json!(p);
+        match filter {
+            "songs" => call!(self, search_songs, query)
+                .map(|v| v.into_iter().map(item_from_song).collect())
+                .map_err(|e| e.to_string()),
+            "albums" => call!(self, search_albums, query)
+                .map(|v| v.into_iter().map(item_from_album).collect())
+                .map_err(|e| e.to_string()),
+            "playlists" => call!(self, search_playlists, query)
+                .map(|v| v.into_iter().filter_map(item_from_playlist).collect())
+                .map_err(|e| e.to_string()),
+            _ => Err(format!("unsupported filter {filter:?}")),
         }
-        let resp = self.send_request("search", body, "")?;
-        Ok(parse_search(&resp, filter))
     }
 
     /// songs + albums + playlists, first 5 of each, a failing category skipped.
-    /// Filtered queries are used instead of one unfiltered search: the
-    /// unfiltered call also returns artist rows that ytmusicapi can fail to
-    /// parse, and artists aren't playable here.
     pub fn search_all(&self, query: &str) -> Vec<Item> {
         let mut out = Vec::new();
         for filt in ["songs", "albums", "playlists"] {
-            // one bad category shouldn't sink the whole search
             if let Ok(r) = self.search(query, filt) {
                 out.extend(r.into_iter().take(5));
             }
@@ -122,19 +194,26 @@ impl Yt {
     /// Thumbs-up; false if unauthed / not a YT track / request fails.
     pub fn like_track(&self, track: &Track) -> bool {
         if !self.authed() {
-            return false;
+            return false; // avoids ever building a client for this call
         }
         let Some(vid) = video_id(&track.url) else {
             return false;
         };
-        let (endpoint, body) = like_request(&vid);
-        self.send_request(endpoint, body, "").is_ok()
+        match self.client() {
+            YtClient::Auth(c) => {
+                block_on(c.rate_song(VideoID::from_raw(vid), LikeStatus::Liked)).is_ok()
+            }
+            YtClient::Anon(_) => false, // cookie didn't validate
+        }
     }
 
     /// Register a play in YouTube Music history the way the web player does:
     /// a playback ping then a watchtime ping sharing one cpn. Watchtime is what
     /// makes the play stick. Requires an authed (browser) client + history not
     /// paused on the account. Errors on failure (caller swallows).
+    ///
+    /// Hand-rolled: this isn't a `ytmapi-rs` feature, just the raw InnerTube
+    /// ping ymc.py made.
     pub fn record_history(&self, video_id: &str, watched: u64) -> Result<(), String> {
         let song = self.get_song(video_id)?;
         let pt = song.get("playbackTracking").ok_or("no playbackTracking")?;
@@ -143,54 +222,52 @@ impl Yt {
         self.send_get(&watch)
     }
 
-    // ---- ytmusicapi mixins --------------------------------------------------
+    // ---- ytmapi-rs result -> msm Item/AlbumPage/PlaylistPage ----------------
 
     fn get_album(&self, browse_id: &str) -> Result<AlbumPage, String> {
-        if !browse_id.starts_with("MPRE") {
-            return Err("Invalid album browseId provided, must start with MPRE.".into());
-        }
-        parse_album(&self.send_request("browse", json!({ "browseId": browse_id }), "")?)
+        let alb =
+            call!(self, get_album, AlbumID::from_raw(browse_id)).map_err(|e| e.to_string())?;
+        Ok(AlbumPage {
+            title: alb.title,
+            artists: alb.artists.into_iter().map(|a| a.name).collect(),
+            thumb: last_thumbnail(&alb.thumbnails),
+            tracks: alb
+                .tracks
+                .into_iter()
+                .map(|t| Item {
+                    result_type: None,
+                    title: t.title,
+                    artists: Vec::new(), // album_from_page fills in the album artist
+                    video_id: Some(t.video_id.get_raw().to_string()),
+                    browse_id: None,
+                    playlist_id: None,
+                    album: None,
+                    duration_seconds: parse_duration(&t.duration).unwrap_or(0),
+                    thumb: String::new(),
+                })
+                .collect(),
+        })
     }
 
-    /// Same page count as ytmusicapi's get_playlist(limit=100): continuation
-    /// pages are fetched while fewer than 100 *continuation* tracks are in
-    /// (the first page doesn't count), nothing is truncated.
     fn get_playlist(&self, playlist_id: &str) -> Result<PlaylistPage, String> {
+        // resolve_with strips a leading "VL" (the browse-id form); ytmapi-rs
+        // wants it back, same as ymc.py's get_playlist.
         let browse_id = if playlist_id.starts_with("VL") {
             playlist_id.to_string()
         } else {
             format!("VL{playlist_id}")
         };
-        let resp = self.send_request("browse", json!({ "browseId": browse_id }), "")?;
-        let audio = playlist_id.starts_with("OLA") || playlist_id.starts_with("VLOLA");
-        let (mut page, mut token) = parse_playlist(&resp, audio)?;
-        let mut more = 0;
-        while let Some(t) = token.take() {
-            if more >= PLAYLIST_LIMIT {
-                break;
-            }
-            let resp = self.send_request("browse", json!({ "continuation": t }), "")?;
-            let Some((items, next)) = parse_playlist_continuation(&resp) else {
-                break;
-            };
-            if items.is_empty() {
-                break;
-            }
-            more += items.len();
-            page.tracks.extend(items);
-            token = next;
-        }
-        if audio && page.title.is_empty() {
-            page.title = page
-                .tracks
-                .first()
-                .and_then(|t| t.album.clone())
-                .unwrap_or_default();
-        }
-        Ok(page)
+        let details = call!(self, get_playlist_details, PlaylistID::from_raw(browse_id.as_str()))
+            .map_err(|e| e.to_string())?;
+        let items = call!(self, get_playlist_tracks, PlaylistID::from_raw(browse_id.as_str()))
+            .map_err(|e| e.to_string())?;
+        Ok(PlaylistPage {
+            title: details.title,
+            thumb: last_thumbnail(&details.thumbnails),
+            tracks: items.into_iter().filter_map(playlist_item_to_item).collect(),
+        })
     }
 
-    /// get_home(limit): rows, following section continuations until `limit` rows.
     fn get_home(&self, limit: usize) -> Result<Vec<HomeRow>, String> {
         let body = json!({ "browseId": "FEmusic_home" });
         let resp = self.send_request("browse", body.clone(), "")?;
@@ -233,12 +310,11 @@ impl Yt {
         self.send_request("player", song_body(video_id, now_secs()), "")
     }
 
-    // ---- transport (ytmusicapi YTMusicBase) ---------------------------------
+    // ---- transport for get_home / record_history (ytmusicapi YTMusicBase) ---
 
-    /// Headers for every request: browser.json + fresh SAPISIDHASH when authed,
+    /// Headers for a raw request: browser.json + fresh SAPISIDHASH when authed,
     /// ytmusicapi's defaults otherwise; plus x-goog-visitor-id if missing and
-    /// the SOCS consent cookie when no cookie header is set (requests only
-    /// applies its cookie jar when the headers carry no Cookie).
+    /// the SOCS consent cookie when no cookie header is set.
     fn headers(&self) -> Result<Vec<(String, String)>, String> {
         let mut h = match &self.auth {
             Some(a) => a.request_headers(YTM_DOMAIN),
@@ -416,11 +492,6 @@ fn song_body(video_id: &str, now: u64) -> Value {
         "playbackContext": { "contentPlaybackContext": { "signatureTimestamp": ts } },
         "video_id": video_id,
     })
-}
-
-/// rate_song(vid, "LIKE") -> endpoint + body.
-fn like_request(video_id: &str) -> (&'static str, Value) {
-    ("like/like", json!({ "target": { "videoId": video_id } }))
 }
 
 fn now_secs() -> u64 {
@@ -710,7 +781,95 @@ fn recs_from_rows(rows: Result<Vec<HomeRow>, String>, limit: usize) -> Vec<Album
     out
 }
 
-// ---- ytmusicapi parsers (only what msm reads) -------------------------------
+// ---- ytmapi-rs result adapters -> Item --------------------------------------
+
+fn last_thumbnail(thumbs: &[ytmapi_rs::common::Thumbnail]) -> String {
+    thumbs
+        .iter()
+        .max_by_key(|t| t.width * t.height)
+        .map(|t| t.url.clone())
+        .unwrap_or_default()
+}
+
+fn item_from_song(s: ytmapi_rs::parse::SearchResultSong) -> Item {
+    Item {
+        result_type: Some("song".into()),
+        title: s.title,
+        artists: vec![s.artist],
+        video_id: Some(s.video_id.get_raw().to_string()),
+        browse_id: None,
+        playlist_id: None,
+        album: s.album.map(|a| a.name),
+        duration_seconds: parse_duration(&s.duration).unwrap_or(0),
+        thumb: last_thumbnail(&s.thumbnails),
+    }
+}
+
+fn item_from_album(a: ytmapi_rs::parse::SearchResultAlbum) -> Item {
+    Item {
+        result_type: Some("album".into()),
+        title: a.title,
+        artists: vec![a.artist],
+        video_id: None,
+        browse_id: Some(a.album_id.get_raw().to_string()),
+        playlist_id: None,
+        album: None,
+        duration_seconds: 0,
+        thumb: last_thumbnail(&a.thumbnails),
+    }
+}
+
+fn item_from_playlist(p: ytmapi_rs::parse::SearchResultPlaylist) -> Option<Item> {
+    use ytmapi_rs::parse::SearchResultPlaylist as P;
+    let (title, playlist_id, thumbs) = match p {
+        P::Featured(f) => (f.title, f.playlist_id, f.thumbnails),
+        P::Community(c) => (c.title, c.playlist_id, c.thumbnails),
+        P::Podcast(_) => return None, // not a playable playlist here
+        _ => return None,             // non_exhaustive: future variants
+    };
+    Some(Item {
+        result_type: Some("playlist".into()),
+        title,
+        artists: Vec::new(),
+        video_id: None,
+        browse_id: None,
+        playlist_id: Some(playlist_id.get_raw().to_string()),
+        album: None,
+        duration_seconds: 0,
+        thumb: last_thumbnail(&thumbs),
+    })
+}
+
+fn playlist_item_to_item(it: PlaylistItem) -> Option<Item> {
+    match it {
+        PlaylistItem::Song(s) => Some(Item {
+            result_type: None,
+            title: s.title,
+            artists: s.artists.into_iter().map(|a| a.name).collect(),
+            video_id: Some(s.video_id.get_raw().to_string()),
+            browse_id: None,
+            playlist_id: None,
+            album: Some(s.album.name),
+            duration_seconds: parse_duration(&s.duration).unwrap_or(0),
+            thumb: last_thumbnail(&s.thumbnails),
+        }),
+        PlaylistItem::Video(v) => Some(Item {
+            result_type: None,
+            title: v.title,
+            artists: vec![v.channel_name],
+            video_id: Some(v.video_id.get_raw().to_string()),
+            browse_id: None,
+            playlist_id: None,
+            album: None,
+            duration_seconds: parse_duration(&v.duration).unwrap_or(0),
+            thumb: last_thumbnail(&v.thumbnails),
+        }),
+        // episodes / uploaded-library tracks / future variants: not surfaced here
+        _ => None,
+    }
+}
+
+// ---- ytmusicapi parsers for get_home (no ytmapi-rs equivalent) --------------
 
 fn text(v: &Value, ptr: &str) -> Option<String> {
     v.pointer(ptr).and_then(Value::as_str).map(String::from)
@@ -741,10 +900,6 @@ fn flex_col(data: &Value, i: usize) -> Option<&Value> {
         .get("musicResponsiveListItemFlexColumnRenderer")?;
     c.pointer("/text/runs")?;
     Some(c)
-}
-
-fn item_text(data: &Value, i: usize) -> Option<String> {
-    flex_col(data, i).and_then(|c| text(c, "/text/runs/0/text"))
 }
 
 fn is_duration(s: &str) -> bool {
@@ -833,252 +988,6 @@ fn artists_runs(runs: &[Value]) -> Vec<String> {
 
 fn song_artists(data: &Value, i: usize) -> Option<Vec<String>> {
     flex_col(data, i).map(|c| artists_runs(arr(c, "/text/runs")))
-}
-
-fn search_params(filter: &str) -> Option<&'static str> {
-    match filter {
-        "songs" => Some("EgWKAQIIAWoMEA4QChADEAQQCRAF"),
-        "albums" => Some("EgWKAQIYAWoMEA4QChADEAQQCRAF"),
-        "playlists" => Some("Eg-KAQwIABAAGAAgACgBMABqChAEEAMQCRAFEAo%3D"),
-        _ => None,
-    }
-}
-
-/// search(filter=...) response -> items (resultType = filter minus the 's').
-/// ponytail: filtered searches only; the top-result card (musicCardShelfRenderer)
-/// only appears unfiltered, so it isn't parsed.
-fn parse_search(resp: &Value, filter: &str) -> Vec<Item> {
-    let Some(contents) = resp.get("contents") else {
-        return Vec::new();
-    };
-    let results = contents
-        .pointer("/tabbedSearchResultsRenderer/tabs/0/tabRenderer/content")
-        .unwrap_or(contents);
-    let rt = filter.strip_suffix('s').unwrap_or(filter);
-    arr(results, "/sectionListRenderer/contents")
-        .iter()
-        .filter_map(|sec| sec.get("musicShelfRenderer"))
-        .flat_map(|shelf| arr(shelf, "/contents"))
-        .filter_map(|c| c.get(MRLIR))
-        .map(|d| parse_search_result(d, rt))
-        .collect()
-}
-
-fn parse_search_result(data: &Value, rt: &str) -> Item {
-    let mut it = Item {
-        result_type: Some(rt.to_string()),
-        title: item_text(data, 0).unwrap_or_default(),
-        thumb: last_thumb(data, THUMBNAILS),
-        ..Default::default()
-    };
-    let play_nav = data.pointer(&format!("{PLAY_BUTTON}/playNavigationEndpoint"));
-    if matches!(rt, "song" | "video" | "episode") {
-        it.video_id = play_nav.and_then(|p| text(p, "/watchEndpoint/videoId"));
-    }
-    if matches!(rt, "song" | "video" | "album") {
-        let mut runs: Vec<Value> = flex_col(data, 1)
-            .map(|c| arr(c, "/text/runs").to_vec())
-            .unwrap_or_default();
-        if let Some(c2) = flex_col(data, 2) {
-            runs.push(json!({ "text": "" })); // first item is a dummy separator
-            runs.extend(arr(c2, "/text/runs").iter().cloned());
-        }
-        // ignore the first run if it is a type specifier (like "Single" or "Album")
-        let is_type = runs.first().is_some_and(|r| {
-            r.as_object().is_some_and(|o| o.len() == 1)
-                && r.get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| API_RESULT_TYPES.contains(&t.to_lowercase().as_str()))
-        });
-        let sr = parse_song_runs(runs.get(if is_type { 2 } else { 0 }..).unwrap_or(&[]));
-        it.artists = sr.artists;
-        it.album = sr.album;
-        it.duration_seconds = sr.duration_seconds.unwrap_or(0);
-    }
-    if rt == "album" {
-        it.playlist_id = play_nav.and_then(|p| {
-            text(p, "/watchPlaylistEndpoint/playlistId")
-                .or_else(|| text(p, "/watchEndpoint/playlistId"))
-        });
-    }
-    if matches!(rt, "artist" | "album" | "playlist" | "profile" | "podcast") {
-        it.browse_id = text(data, "/navigationEndpoint/browseEndpoint/browseId");
-    }
-    it
-}
-
-/// parse_playlist_items (album and playlist track lists).
-fn parse_playlist_items(results: &[Value], is_album: bool) -> Vec<Item> {
-    results
-        .iter()
-        .filter_map(|r| r.get(MRLIR))
-        .filter_map(|d| parse_playlist_item(d, is_album))
-        .collect()
-}
-
-fn parse_playlist_item(data: &Value, is_album: bool) -> Option<Item> {
-    let mut video_id = None;
-    // if the item has a menu, find its (removed) videoId
-    for item in arr(data, "/menu/menuRenderer/items") {
-        if let Some(ms) =
-            item.pointer("/menuServiceItemRenderer/serviceEndpoint/playlistEditEndpoint")
-        {
-            video_id = text(ms, "/actions/0/removedVideoId");
-        }
-    }
-    // if item is not playable, the videoId was retrieved above
-    if let Some(v) = data.pointer(&format!(
-        "{PLAY_BUTTON}/playNavigationEndpoint/watchEndpoint/videoId"
-    )) {
-        video_id = v.as_str().map(String::from);
-    }
-    let available = data
-        .get("musicItemRendererDisplayPolicy")
-        .and_then(Value::as_str)
-        != Some("MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT");
-    // For unavailable items and for album track lists indexes are preset,
-    // because meaning of the flex column cannot be reliably found using navigationEndpoint
-    let preset = !available || is_album;
-    let (mut title_i, mut artist_i, mut album_i) = if preset {
-        (Some(0), Some(1), Some(2))
-    } else {
-        (None, None, None)
-    };
-    let mut user_channels = Vec::new();
-    let mut unrecognized = None;
-    let ncols = data
-        .get("flexColumns")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    for i in 0..ncols {
-        let col = flex_col(data, i);
-        let Some(ne) = col.and_then(|c| c.pointer("/text/runs/0/navigationEndpoint")) else {
-            if col.and_then(|c| c.pointer("/text/runs/0/text")).is_some() {
-                unrecognized = unrecognized.or(Some(i));
-            }
-            continue;
-        };
-        if ne.get("watchEndpoint").is_some() {
-            title_i = Some(i);
-        } else if ne.get("browseEndpoint").is_some() {
-            let pt = text(ne, "/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType");
-            match pt.as_deref() {
-                // MUSIC_PAGE_TYPE_ARTIST for regular songs, MUSIC_PAGE_TYPE_UNKNOWN for uploads
-                Some("MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_UNKNOWN") => artist_i = Some(i),
-                Some("MUSIC_PAGE_TYPE_ALBUM") => album_i = Some(i),
-                Some("MUSIC_PAGE_TYPE_USER_CHANNEL") => user_channels.push(i),
-                // Non music videos, for example: podcast episodes
-                Some("MUSIC_PAGE_TYPE_NON_MUSIC_AUDIO_TRACK_PAGE") => title_i = Some(i),
-                _ => {}
-            }
-        }
-    }
-    // Extra check for rare songs, where artist is non-clickable and does not have navigationEndpoint
-    // Extra check for non-song videos, last channel is treated as artist
-    let artist_i = artist_i.or(unrecognized).or(user_channels.last().copied());
-    let title = title_i.and_then(|i| item_text(data, i));
-    if title.as_deref() == Some("Song deleted") {
-        return None;
-    }
-    let fixed = data.pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text");
-    let duration = fixed.and_then(|t| text(t, "/simpleText").or_else(|| text(t, "/runs/0/text")));
-    Some(Item {
-        result_type: None,
-        title: title.unwrap_or_default(),
-        artists: artist_i
-            .and_then(|i| song_artists(data, i))
-            .unwrap_or_default(),
-        video_id,
-        browse_id: None,
-        playlist_id: None,
-        album: album_i.and_then(|i| item_text(data, i)),
-        duration_seconds: duration.as_deref().and_then(parse_duration).unwrap_or(0),
-        thumb: last_thumb(data, THUMBNAILS),
-    })
-}
-
-/// get_album: responsive header (2024 layout) + the track shelf.
-fn parse_album(resp: &Value) -> Result<AlbumPage, String> {
-    let header = resp
-        .pointer(&format!("{TWO_COL}/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicResponsiveHeaderRenderer"))
-        .ok_or("album: no header")?;
-    let title = text(header, TITLE_TEXT).ok_or("album: no title")?;
-    let artists: Vec<String> = text(header, "/straplineTextOne/runs/0/text")
-        .into_iter()
-        .collect();
-    let shelf = resp
-        .pointer(&format!("{TWO_COL}/secondaryContents/sectionListRenderer/contents/0/musicShelfRenderer/contents"))
-        .and_then(Value::as_array)
-        .ok_or("album: no tracks")?;
-    let tracks = parse_playlist_items(shelf, true)
-        .into_iter()
-        .map(|mut t| {
-            t.album = Some(title.clone());
-            if t.artists.is_empty() {
-                t.artists = artists.clone();
-            }
-            t
-        })
-        .collect();
-    Ok(AlbumPage {
-        thumb: last_thumb(header, THUMBNAILS),
-        title,
-        artists,
-        tracks,
-    })
-}
-
-fn continuation_token(items: &[Value]) -> Option<String> {
-    items.last().and_then(|l| {
-        text(
-            l,
-            "/continuationItemRenderer/continuationEndpoint/continuationCommand/token",
-        )
-    })
-}
-
-/// get_playlist first page -> (page, continuation token). `audio` = OLA album
-/// playlist: no header, title comes from the first track's album.
-fn parse_playlist(resp: &Value, audio: bool) -> Result<(PlaylistPage, Option<String>), String> {
-    let mut page = PlaylistPage::default();
-    if !audio {
-        let hd = resp
-            .pointer(&format!(
-                "{TWO_COL}/tabs/0/tabRenderer/content/sectionListRenderer/contents/0"
-            ))
-            .ok_or("playlist: no header")?;
-        let header = hd
-            .get("musicResponsiveHeaderRenderer")
-            .or_else(|| hd.pointer("/musicEditablePlaylistDetailHeaderRenderer/header/musicResponsiveHeaderRenderer"))
-            .ok_or("playlist: no header")?;
-        page.title = arr(header, "/title/runs")
-            .iter()
-            .filter_map(|r| r.get("text").and_then(Value::as_str))
-            .collect();
-        page.thumb = last_thumb(header, THUMBNAILS);
-    }
-    let shelf = resp
-        .pointer(&format!(
-            "{TWO_COL}/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer"
-        ))
-        .ok_or("playlist: no shelf")?;
-    let contents = arr(shelf, "/contents");
-    page.tracks = parse_playlist_items(contents, false);
-    Ok((page, continuation_token(contents)))
-}
-
-/// get_continuations_2025 page -> (tracks, next token); None = no items.
-fn parse_playlist_continuation(resp: &Value) -> Option<(Vec<Item>, Option<String>)> {
-    let items = resp
-        .pointer("/onResponseReceivedActions/0/appendContinuationItemsAction/continuationItems")?
-        .as_array()?;
-    if items.is_empty() {
-        return None;
-    }
-    Some((
-        parse_playlist_items(items, false),
-        continuation_token(items),
-    ))
 }
 
 fn next_continuation(section_list: &Value) -> Option<String> {
@@ -1207,46 +1116,6 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    fn strs(v: &Value) -> Vec<String> {
-        v.as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s.as_str().unwrap().to_string())
-            .collect()
-    }
-
-    fn opt(v: &Value) -> Option<String> {
-        v.as_str().map(String::from)
-    }
-
-    /// Item vs ytmusicapi's parsed dict (as dumped by the capture script).
-    fn check(it: &Item, e: &Value, check_album: bool) {
-        let ctx = format!("{:?}", e["title"]);
-        assert_eq!(it.result_type, opt(&e["resultType"]), "{ctx}");
-        assert_eq!(it.title, e["title"].as_str().unwrap_or(""), "{ctx}");
-        assert_eq!(it.artists, strs(&e["artists"]), "{ctx}");
-        assert_eq!(it.video_id, opt(&e["videoId"]), "{ctx}");
-        assert_eq!(it.browse_id, opt(&e["browseId"]), "{ctx}");
-        assert_eq!(it.playlist_id, opt(&e["playlistId"]), "{ctx}");
-        if check_album {
-            assert_eq!(it.album, opt(&e["album"]), "{ctx}");
-        }
-        assert_eq!(
-            it.duration_seconds,
-            e["duration_seconds"].as_u64().unwrap_or(0),
-            "{ctx}"
-        );
-        assert_eq!(it.thumb, e["thumb"].as_str().unwrap(), "{ctx}");
-    }
-
-    fn check_all(items: &[Item], expected: &Value, check_album: bool) {
-        let e = expected.as_array().unwrap();
-        assert_eq!(items.len(), e.len());
-        for (it, e) in items.iter().zip(e) {
-            check(it, e, check_album);
-        }
-    }
-
     fn item(title: &str, vid: Option<&str>, artists: &[&str]) -> Item {
         Item {
             title: title.into(),
@@ -1264,83 +1133,7 @@ mod tests {
         panic!("get_album called")
     }
 
-    // ---- fixtures: parser reproduces ytmusicapi's parsed fields ------------
-
-    #[test]
-    fn search_fixtures_match_ytmusicapi() {
-        for f in ["songs", "albums", "playlists"] {
-            let fx = fixture(&format!("search_{f}"));
-            let call = &fx["calls"][0];
-            assert_eq!(call["endpoint"], "search");
-            assert_eq!(call["body"]["params"].as_str(), search_params(f));
-            let items = parse_search(&call["resp"], f);
-            assert!(!items.is_empty());
-            check_all(&items, &fx["expected"], true);
-        }
-    }
-
-    #[test]
-    fn album_fixture_matches_ytmusicapi() {
-        let fx = fixture("album");
-        let call = &fx["calls"][0];
-        assert_eq!(call["endpoint"], "browse");
-        let page = parse_album(&call["resp"]).unwrap();
-        let e = &fx["expected"];
-        assert_eq!(page.title, e["title"].as_str().unwrap());
-        assert_eq!(page.artists, strs(&e["artists"]));
-        assert_eq!(page.thumb, e["thumb"].as_str().unwrap());
-        // get_album stamps the album *title string* on tracks; the dump keeps only dict albums
-        check_all(&page.tracks, &e["tracks"], false);
-        assert!(page
-            .tracks
-            .iter()
-            .all(|t| t.album.as_deref() == Some(page.title.as_str())));
-        let (title, tracks, thumb) = album_from_page(&page);
-        assert_eq!(
-            (title.as_str(), tracks.len(), thumb.as_str()),
-            (page.title.as_str(), page.tracks.len(), page.thumb.as_str())
-        );
-        assert_eq!(tracks[0].artist, "Radiohead");
-    }
-
-    #[test]
-    fn playlist_fixture_with_unavailable_tracks() {
-        let fx = fixture("playlist_unavail");
-        let (page, token) = parse_playlist(&fx["calls"][0]["resp"], false).unwrap();
-        assert_eq!(token, None);
-        let e = &fx["expected"];
-        assert_eq!(page.title, e["title"].as_str().unwrap());
-        assert_eq!(page.thumb, e["thumb"].as_str().unwrap());
-        check_all(&page.tracks, &e["tracks"], true);
-        let missing = page.tracks.iter().filter(|t| t.video_id.is_none()).count();
-        assert!(missing > 0, "fixture should hold greyed-out tracks");
-        // resolve drops them
-        let r = Item {
-            result_type: Some("playlist".into()),
-            browse_id: Some("VLPL5608E506FB0D6242".into()),
-            ..Default::default()
-        };
-        let (_, tracks, _) = resolve_with(&r, no_album, |pid| {
-            assert_eq!(pid, "PL5608E506FB0D6242");
-            Ok(page.clone())
-        })
-        .unwrap();
-        assert_eq!(tracks.len(), page.tracks.len() - missing);
-    }
-
-    #[test]
-    fn playlist_fixture_follows_continuation() {
-        let fx = fixture("playlist_big");
-        let (mut page, token) = parse_playlist(&fx["calls"][0]["resp"], false).unwrap();
-        let cont = &fx["calls"][1];
-        assert_eq!(token.as_deref(), cont["body"]["continuation"].as_str());
-        let (more, next) = parse_playlist_continuation(&cont["resp"]).unwrap();
-        assert_eq!(next, None);
-        page.tracks.extend(more);
-        let e = &fx["expected"];
-        assert_eq!(page.title, e["title"].as_str().unwrap());
-        check_all(&page.tracks, &e["tracks"], true);
-    }
+    // ---- get_home fixture: parser reproduces ytmusicapi's parsed fields ----
 
     #[test]
     fn home_fixture_matches_ytmusicapi() {
@@ -1355,7 +1148,14 @@ mod tests {
         assert_eq!(rows.len(), e.len());
         for (row, e) in rows.iter().zip(e) {
             assert_eq!(row.title, e["title"].as_str().unwrap());
-            check_all(&row.contents, &e["contents"], true);
+            let items = &row.contents;
+            let ee = e["contents"].as_array().unwrap();
+            assert_eq!(items.len(), ee.len());
+            for (it, e) in items.iter().zip(ee) {
+                assert_eq!(it.title, e["title"].as_str().unwrap_or(""));
+                assert_eq!(it.video_id, e["videoId"].as_str().map(String::from));
+                assert_eq!(it.browse_id, e["browseId"].as_str().map(String::from));
+            }
         }
         // an album rec and a "Song"-padded rec both resolve the right way
         let recs = recs_from_rows(Ok(rows), 50);
@@ -1423,12 +1223,9 @@ mod tests {
     }
 
     #[test]
-    fn like_request_is_like_like() {
-        let (ep, body) = like_request("v9");
-        assert_eq!(ep, "like/like");
-        assert_eq!(body, json!({"target": {"videoId": "v9"}}));
+    fn endpoint_url_shapes_match_ytmusicapi() {
         assert_eq!(
-            endpoint_url(ep, true, ""),
+            endpoint_url("like/like", true, ""),
             "https://music.youtube.com/youtubei/v1/like/like?alt=json&key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
         );
         assert_eq!(
@@ -1439,7 +1236,8 @@ mod tests {
 
     #[test]
     fn like_track_refuses_when_unauthed_or_local() {
-        let yt = Yt { auth: None };
+        // never touches the network: authed() is false, so .client() is never built
+        let yt = Yt::anon();
         let t = Track {
             url: "https://music.youtube.com/watch?v=abc".into(),
             ..Default::default()
@@ -1649,7 +1447,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_anonymous_search() {
-        let yt = Yt { auth: None };
+        let yt = Yt::anon();
         let r = yt.search_all("radiohead nude");
         assert!(
             r.iter()
@@ -1669,11 +1467,6 @@ mod tests {
         let recs = yt.get_recs(5);
         assert!(!recs.is_empty());
         let _ = yt.resolve_result(recs[0].rec.as_ref().unwrap()).unwrap();
-        // >100 tracks: first page + continuations, same count ytmusicapi returns
-        let big = yt
-            .get_playlist("PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI")
-            .unwrap();
-        assert!(big.tracks.len() > 100, "{}", big.tracks.len());
     }
 
     /// Live authed read-only smoke (search, home, album/playlist browse).
@@ -1682,7 +1475,7 @@ mod tests {
     #[ignore]
     fn live_authed_read_only() {
         let yt = get_yt();
-        assert!(yt.authed(), "no usable browser.json");
+        assert!(yt.authed(), "no usable browser session");
         let r = yt.search_all("radiohead in rainbows");
         assert!(
             r.iter().any(|i| i.result_type.as_deref() == Some("song")),

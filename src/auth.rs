@@ -48,6 +48,12 @@ impl Auth {
         Some(Auth { headers })
     }
 
+    /// Raw `name=value; ...` cookie header, for handing to ytmapi-rs's
+    /// `BrowserToken::from_str` (it computes its own SAPISIDHASH).
+    pub fn cookie_string(&self) -> Option<&str> {
+        self.headers.get("cookie").map(String::as_str)
+    }
+
     /// Headers to send on an authed InnerTube request to `origin`: the saved
     /// headers plus a fresh `authorization: SAPISIDHASH <ts>_<sha1>` computed
     /// from the cookie's `__Secure-3PAPISID` and the saved origin.

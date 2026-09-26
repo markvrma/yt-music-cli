@@ -30,10 +30,6 @@ pub fn config_dir() -> PathBuf {
 pub fn hist_path() -> PathBuf {
     config_dir().join("history.json")
 }
-/// ~/.config/ymc/browser.json — ytmusicapi browser-auth headers
-pub fn auth_path() -> PathBuf {
-    config_dir().join("browser.json")
-}
 /// ~/.config/ymc/art
 pub fn art_cache() -> PathBuf {
     config_dir().join("art")
@@ -41,10 +37,6 @@ pub fn art_cache() -> PathBuf {
 /// ~/Music
 pub fn local_music() -> PathBuf {
     home().join("Music")
-}
-/// ~/.cache/msm
-pub fn stream_cache() -> PathBuf {
-    home().join(".cache/msm")
 }
 /// $MSM_COOKIE_BROWSER, default "chrome"
 pub fn cookie_browser() -> String {
@@ -118,7 +110,7 @@ pub struct Item {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("auth") {
-        auth::setup_auth(args.get(2).map(String::as_str));
+        auth::check_auth();
         return;
     }
     for tool in ["mpv", "cmusfm"] {
